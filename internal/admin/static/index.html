@@ -1535,7 +1535,7 @@ function getFilteredNodes() {
   const tag = document.getElementById('tagFilter').value;
   return allNodes.filter(n => {
     if (tag && n.tag !== tag) return false;
-    if (q && !n.name.includes(q) && !(n.displayName||'').toLowerCase().includes(q) && !(n.tag||'').toLowerCase().includes(q)) return false;
+    if (q && !(n.name||'').toLowerCase().includes(q) && !(n.displayName||'').toLowerCase().includes(q) && !(n.tag||'').toLowerCase().includes(q)) return false;
     return true;
   });
 }
@@ -2017,7 +2017,7 @@ function flagEnabled(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }
 
-function safeLogLevel(value) {
+function safeConfigLogLevel(value) {
   const level = String(value || 'info').trim().toLowerCase();
   return ['silent', 'error', 'warn', 'info', 'debug'].includes(level) ? level : 'info';
 }
@@ -2191,7 +2191,7 @@ async function openConfigModal() {
     return;
   }
   const c = r.config;
-  document.getElementById('cfg-logLevel').value = safeLogLevel(c.logLevel);
+  document.getElementById('cfg-logLevel').value = safeConfigLogLevel(c.logLevel);
   document.getElementById('cfg-logAccess').checked = c.logAccess !== false;
   document.getElementById('cfg-capyStripEmby').checked = flagEnabled(c.capyStripEmby);
   document.getElementById('cfg-emosCompat').checked = !!c.emosCompat;
@@ -3133,7 +3133,24 @@ function attr(s) {
 }
 
 function copyText(t) {
-  navigator.clipboard.writeText(t).then(() => toast('已复制', 'ok'));
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(t).then(() => toast('已复制', 'ok')).catch(() => legacyCopyText(t));
+    return;
+  }
+  legacyCopyText(t);
+}
+
+function legacyCopyText(t) {
+  const ta = document.createElement('textarea');
+  ta.value = t;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) {}
+  ta.remove();
+  toast(ok ? '已复制' : '复制失败，请手动复制', ok ? 'ok' : 'err');
 }
 
 function downloadJson(filename, data) {
