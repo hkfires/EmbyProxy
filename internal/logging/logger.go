@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -143,17 +142,16 @@ type logBuffer struct {
 }
 
 type logHistory struct {
-	mu              sync.Mutex
-	path            string
-	entriesPerFile  int
-	maxFiles        int
-	entryCount      int
-	retainedEntries int
-	oldestID        uint64
-	file            *os.File
-	writer          *bufio.Writer
-	closed          bool
-	done            chan struct{}
+	mu             sync.Mutex
+	path           string
+	entriesPerFile int
+	maxFiles       int
+	entryCount     int
+	file           *os.File
+	writer         *bufio.Writer
+	index          *logBuffer
+	closed         bool
+	done           chan struct{}
 }
 
 func (f LogFilter) empty() bool {
@@ -169,19 +167,6 @@ func (f LogFilter) match(e LogEntry) bool {
 		return false
 	}
 	return true
-}
-
-func filterLogEntries(entries []LogEntry, filter LogFilter) []LogEntry {
-	if filter.empty() {
-		return entries
-	}
-	filtered := make([]LogEntry, 0, len(entries))
-	for _, entry := range entries {
-		if filter.match(entry) {
-			filtered = append(filtered, entry)
-		}
-	}
-	return filtered
 }
 
 func New(level string, accessLog bool) *Logger {
@@ -476,13 +461,26 @@ func (b *logBuffer) Append(entry LogEntry) LogEntry {
 	defer b.mu.Unlock()
 	b.next++
 	entry.ID = b.next
+	b.appendLocked(entry)
+	return entry
+}
+
+func (b *logBuffer) AppendWithID(entry LogEntry) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if entry.ID > b.next {
+		b.next = entry.ID
+	}
+	b.appendLocked(entry)
+}
+
+func (b *logBuffer) appendLocked(entry LogEntry) {
 	if len(b.entries) < b.capacity {
 		b.entries = append(b.entries, entry)
-		return entry
+		return
 	}
 	b.entries[b.start] = entry
 	b.start = (b.start + 1) % b.capacity
-	return entry
 }
 
 func (b *logBuffer) Entries(limit int) []LogEntry {
@@ -493,21 +491,35 @@ func (b *logBuffer) Entries(limit int) []LogEntry {
 func (b *logBuffer) Clear() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.clearLocked()
+}
+
+func (b *logBuffer) clearLocked() {
+	for i := range b.entries {
+		b.entries[i] = LogEntry{}
+	}
 	b.start = 0
 	b.entries = b.entries[:0]
 }
 
-func (b *logBuffer) EntriesBefore(limit int, before uint64, filter LogFilter) ([]LogEntry, bool) {
+func (b *logBuffer) snapshot() []LogEntry {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	total := len(b.entries)
+	entries := make([]LogEntry, len(b.entries))
+	for i := 0; i < len(b.entries); i++ {
+		entries[i] = b.entries[(b.start+i)%b.capacity]
+	}
+	return entries
+}
+
+func (b *logBuffer) EntriesBefore(limit int, before uint64, filter LogFilter) ([]LogEntry, bool) {
+	allEntries := b.snapshot()
+	total := len(allEntries)
 	if limit <= 0 || limit > total {
 		limit = total
 	}
 	all := make([]LogEntry, 0, total)
-	for i := 0; i < total; i++ {
-		idx := (b.start + i) % b.capacity
-		entry := b.entries[idx]
+	for _, entry := range allEntries {
 		if (before == 0 || entry.ID < before) && (filter.empty() || filter.match(entry)) {
 			all = append(all, entry)
 		}
@@ -523,16 +535,16 @@ func (b *logBuffer) EntriesBefore(limit int, before uint64, filter LogFilter) ([
 }
 
 func (b *logBuffer) PageNumber(limit, page int, filter LogFilter) ([]LogEntry, int, int, int, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	limit = normalizePageLimit(limit, b.capacity)
-	entries := make([]LogEntry, 0, len(b.entries))
-	for i := 0; i < len(b.entries); i++ {
-		idx := (b.start + i) % b.capacity
-		entry := b.entries[idx]
-		if filter.empty() || filter.match(entry) {
-			entries = append(entries, entry)
+	entries := b.snapshot()
+	limit = normalizePageLimit(limit, len(entries))
+	if !filter.empty() {
+		filtered := make([]LogEntry, 0, len(entries))
+		for _, entry := range entries {
+			if filter.match(entry) {
+				filtered = append(filtered, entry)
+			}
 		}
+		entries = filtered
 	}
 	total := len(entries)
 	totalPages := logPageCount(total, limit)
@@ -558,6 +570,15 @@ func (b *logBuffer) NewestID() uint64 {
 	return b.entries[idx].ID
 }
 
+func (b *logBuffer) OldestID() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.entries) == 0 {
+		return 0
+	}
+	return b.entries[b.start].ID
+}
+
 func newLogHistory(path string, entriesPerFile, maxFiles int) (*logHistory, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -572,7 +593,13 @@ func newLogHistory(path string, entriesPerFile, maxFiles int) (*logHistory, erro
 	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return nil, err
 	}
-	h := &logHistory{path: path, entriesPerFile: entriesPerFile, maxFiles: maxFiles, done: make(chan struct{})}
+	h := &logHistory{
+		path:           path,
+		entriesPerFile: entriesPerFile,
+		maxFiles:       maxFiles,
+		index:          newLogBuffer(entriesPerFile * maxFiles),
+		done:           make(chan struct{}),
+	}
 	if err := h.reset(); err != nil {
 		return nil, err
 	}
@@ -592,12 +619,17 @@ func (h *logHistory) reset() error {
 		}
 	}
 	h.entryCount = 0
-	h.retainedEntries = 0
-	h.oldestID = 0
+	if h.index != nil {
+		h.index.Clear()
+	}
 	return nil
 }
 
 func (h *logHistory) Append(entry LogEntry) error {
+	if h.index != nil {
+		// The runtime index is authoritative and independent of JSONL persistence.
+		h.index.AppendWithID(entry)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
@@ -622,10 +654,6 @@ func (h *logHistory) Append(entry LogEntry) error {
 		return err
 	}
 	h.entryCount++
-	h.retainedEntries++
-	if h.oldestID == 0 || h.retainedEntries == 1 {
-		h.oldestID = entry.ID
-	}
 	return nil
 }
 
@@ -706,59 +734,31 @@ func (h *logHistory) HasBefore(id uint64) bool {
 	if h == nil || id == 0 {
 		return false
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.retainedEntries > 0 && h.oldestID > 0 && h.oldestID < id
+	if h.index == nil {
+		return false
+	}
+	oldestID := h.index.OldestID()
+	return oldestID > 0 && oldestID < id
 }
 
 func (h *logHistory) Page(limit int, before uint64, filter LogFilter) ([]LogEntry, bool, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if err := h.flushWriterLocked(); err != nil {
-		return nil, false, err
+	if h == nil || h.index == nil {
+		return nil, false, nil
 	}
 	if limit <= 0 {
 		limit = h.entriesPerFile
 	}
-	entries := []LogEntry{}
-	for _, path := range h.pathsOldestFirst() {
-		if err := readLogEntries(path, before, &entries); err != nil {
-			return nil, false, err
-		}
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
-	entries = filterLogEntries(entries, filter)
-	if limit > len(entries) {
-		limit = len(entries)
-	}
-	hasOlder := len(entries) > limit
-	if hasOlder {
-		entries = entries[len(entries)-limit:]
-	}
+	entries, hasOlder := h.index.EntriesBefore(limit, before, filter)
 	return entries, hasOlder, nil
 }
 
 func (h *logHistory) PageNumber(limit, page int, filter LogFilter) ([]LogEntry, int, int, int, bool, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if err := h.flushWriterLocked(); err != nil {
-		return nil, 0, 1, 1, false, err
+	if h == nil || h.index == nil {
+		return nil, 0, 1, 1, false, nil
 	}
 	limit = normalizePageLimit(limit, h.entriesPerFile)
-	entries := []LogEntry{}
-	for _, path := range h.pathsOldestFirst() {
-		if err := readLogEntries(path, 0, &entries); err != nil {
-			return nil, 0, 1, 1, false, err
-		}
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
-	entries = filterLogEntries(entries, filter)
-	total := len(entries)
-	totalPages := logPageCount(total, limit)
-	page = clampLogPage(page, totalPages)
-	start, end := logPageBounds(total, limit, page)
-	out := append([]LogEntry(nil), entries[start:end]...)
-	return out, total, totalPages, page, start > 0, nil
+	entries, total, totalPages, page, hasOlder := h.index.PageNumber(limit, page, filter)
+	return entries, total, totalPages, page, hasOlder, nil
 }
 
 func (h *logHistory) rotateLocked() error {
@@ -770,17 +770,11 @@ func (h *logHistory) rotateLocked() error {
 			return err
 		}
 		h.entryCount = 0
-		h.retainedEntries = 0
-		h.oldestID = 0
 		return nil
 	}
 	oldest := rotatedLogPath(h.path, h.maxFiles-1)
 	if err := os.Remove(oldest); err != nil && !os.IsNotExist(err) {
 		return err
-	}
-	if capacity := h.entriesPerFile * h.maxFiles; h.retainedEntries >= capacity {
-		h.retainedEntries -= h.entriesPerFile
-		h.oldestID += uint64(h.entriesPerFile)
 	}
 	for i := h.maxFiles - 2; i >= 1; i-- {
 		from := rotatedLogPath(h.path, i)
@@ -804,46 +798,10 @@ func (h *logHistory) pathsNewestFirst() []string {
 	return paths
 }
 
-func (h *logHistory) pathsOldestFirst() []string {
-	paths := make([]string, 0, h.maxFiles)
-	for i := h.maxFiles - 1; i >= 1; i-- {
-		paths = append(paths, rotatedLogPath(h.path, i))
-	}
-	paths = append(paths, h.path)
-	return paths
-}
-
 func rotatedLogPath(path string, index int) string {
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(path, ext)
 	return base + "." + strconv.Itoa(index) + ext
-}
-
-func readLogEntries(path string, before uint64, out *[]LogEntry) error {
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		var entry LogEntry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			continue
-		}
-		if entry.ID == 0 || (before > 0 && entry.ID >= before) {
-			continue
-		}
-		*out = append(*out, entry)
-	}
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		return err
-	}
-	return nil
 }
 
 func normalizePageLimit(limit, fallback int) int {

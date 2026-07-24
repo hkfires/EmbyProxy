@@ -1,7 +1,9 @@
 package logging
 
 import (
+	"bufio"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -383,6 +385,155 @@ func TestLoggerHistoryPageNumber(t *testing.T) {
 				t.Fatalf("page entries = %q, want %q", got, tt.wantLines)
 			}
 		})
+	}
+}
+
+func TestLoggerHistoryPageNumberUsesMemoryIndex(t *testing.T) {
+	log := New("debug", true)
+	historyPath := filepath.Join(t.TempDir(), "console-logs.jsonl")
+	if err := log.EnableHistory(historyPath, 2, 3); err != nil {
+		t.Fatalf("EnableHistory() error = %v", err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	for i := 1; i <= 7; i++ {
+		log.Info("test", fmt.Sprintf("line-%d", i), nil)
+	}
+
+	if got := log.history.index.Capacity(); got != 6 {
+		t.Fatalf("history index capacity = %d, want 6", got)
+	}
+	page := log.PageNumber(2, 1, LogFilter{})
+	if page.TotalEntries != 6 || page.TotalPages != 3 || !page.HasOlder {
+		t.Fatalf("page metadata = %+v", page)
+	}
+	if got := messages(page.Entries); got != "line-6,line-7" {
+		t.Fatalf("page entries = %q, want latest retained entries", got)
+	}
+
+	if err := log.history.Close(); err != nil {
+		t.Fatalf("history Close() error = %v", err)
+	}
+	for _, path := range log.history.pathsNewestFirst() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("Remove(%q) error = %v", path, err)
+		}
+	}
+
+	page = log.PageNumber(2, 2, LogFilter{})
+	if page.TotalEntries != 6 || page.Page != 2 || messages(page.Entries) != "line-4,line-5" {
+		t.Fatalf("page after deleting history files = %+v", page)
+	}
+}
+
+func TestLoggerHistoryPageNumberDoesNotWaitForHistoryWriteLock(t *testing.T) {
+	log := New("debug", true)
+	if err := log.EnableHistory(filepath.Join(t.TempDir(), "console-logs.jsonl"), 2, 3); err != nil {
+		t.Fatalf("EnableHistory() error = %v", err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	log.Info("test", "line", nil)
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		log.history.mu.Lock()
+		close(locked)
+		<-release
+		log.history.mu.Unlock()
+	}()
+	<-locked
+
+	pageDone := make(chan LogPage, 1)
+	go func() {
+		pageDone <- log.PageNumber(2, 1, LogFilter{})
+	}()
+	select {
+	case page := <-pageDone:
+		if messages(page.Entries) != "line" {
+			t.Fatalf("page entries = %q, want line", messages(page.Entries))
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("PageNumber() waited for the history write lock")
+	}
+	close(release)
+}
+
+type failingLogWriter struct{}
+
+func (failingLogWriter) Write([]byte) (int, error) {
+	return 0, os.ErrPermission
+}
+
+func TestLoggerHistoryIndexKeepsEntriesWhenPersistenceFails(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "console-logs.jsonl")
+	if err != nil {
+		t.Fatalf("CreateTemp() error = %v", err)
+	}
+	log := New("debug", true)
+	log.history = &logHistory{
+		path:           file.Name(),
+		entriesPerFile: 2,
+		maxFiles:       3,
+		file:           file,
+		writer:         bufio.NewWriterSize(failingLogWriter{}, 1),
+		index:          newLogBuffer(6),
+		done:           make(chan struct{}),
+	}
+	t.Cleanup(func() { _ = os.Remove(file.Name()) })
+	t.Cleanup(func() { _ = log.Close() })
+
+	log.Info("test", "line", nil)
+	page := log.PageNumber(2, 1, LogFilter{})
+	if !page.History || messages(page.Entries) != "line" {
+		t.Fatalf("page after persistence failure = %+v", page)
+	}
+}
+
+func TestLoggerHistoryIndexSurvivesPersistenceRecoveryAndRotation(t *testing.T) {
+	log := New("debug", true)
+	historyPath := filepath.Join(t.TempDir(), "console-logs.jsonl")
+	if err := log.EnableHistory(historyPath, 2, 3); err != nil {
+		t.Fatalf("EnableHistory() error = %v", err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	for i := 1; i <= 6; i++ {
+		log.Info("test", fmt.Sprintf("line-%d", i), nil)
+	}
+
+	history := log.history
+	history.mu.Lock()
+	closeErr := history.closeWriterLocked()
+	history.mu.Unlock()
+	if closeErr != nil {
+		t.Fatalf("closeWriterLocked() error = %v", closeErr)
+	}
+	file, err := os.OpenFile(historyPath, os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile() error = %v", err)
+	}
+	failingWriter := bufio.NewWriterSize(failingLogWriter{}, 16)
+	if err := failingWriter.WriteByte('x'); err != nil {
+		t.Fatalf("failing writer setup error = %v", err)
+	}
+	history.mu.Lock()
+	history.file = file
+	history.writer = failingWriter
+	history.mu.Unlock()
+
+	log.Info("test", "line-7", nil)
+	history.mu.Lock()
+	entryCountAfterFailure := history.entryCount
+	history.mu.Unlock()
+	if entryCountAfterFailure != 2 {
+		t.Fatalf("entry count after persistence failure = %d, want 2", entryCountAfterFailure)
+	}
+	for i := 8; i <= 10; i++ {
+		log.Info("test", fmt.Sprintf("line-%d", i), nil)
+	}
+	page := log.PageNumber(10, 1, LogFilter{})
+	if page.TotalEntries != 6 || messages(page.Entries) != "line-5,line-6,line-7,line-8,line-9,line-10" {
+		t.Fatalf("page after persistence recovery = %+v", page)
 	}
 }
 
