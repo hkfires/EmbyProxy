@@ -1939,7 +1939,6 @@ function formatCheckResult(result) {
     if (lowerError.includes('timeout') || lowerError.includes('deadline')) return { type: 'err', text: '超时' };
     return { type: 'err', text: ms ? `${error} · ${ms}` : error };
   }
-  if (Number.isFinite(msValue) && msValue > 9999) return { type: 'err', text: '超时' };
   const status = Number(result.status || 0);
   if (status >= 200 && status < 400) return { type: 'ok', text: ms || '正常' };
   return { type: 'warn', text: `${status || '异常'}${ms ? ' · ' + ms : ''}` };

@@ -14,6 +14,7 @@ import (
 	"embyproxy/internal/buildinfo"
 	"embyproxy/internal/capture"
 	"embyproxy/internal/config"
+	"embyproxy/internal/identity"
 	"embyproxy/internal/logging"
 	"embyproxy/internal/proxy"
 	"embyproxy/internal/requestlog"
@@ -56,6 +57,45 @@ func TestServeAdminValidatesTokenConfig(t *testing.T) {
 func TestAdminIndexIncludesTelegramRemark(t *testing.T) {
 	if !strings.Contains(indexHTML, `id="tg-serverRemark" maxlength="80"`) {
 		t.Fatal("indexHTML missing Telegram server remark input")
+	}
+}
+
+func TestStatusCheckTimeoutAllowsEveryTargetAttempt(t *testing.T) {
+	want := 3 * proxy.UpstreamTargetAttemptTimeout
+	if got := statusCheckTimeout(3); got != want {
+		t.Fatalf("statusCheckTimeout(3) = %v, want %v", got, want)
+	}
+	if got := statusCheckTimeout(0); got != proxy.UpstreamTargetAttemptTimeout {
+		t.Fatalf("statusCheckTimeout(0) = %v, want one target budget", got)
+	}
+	if strings.Contains(indexHTML, "msValue > 9999") {
+		t.Fatal("indexHTML still reports slow successful checks as timeouts")
+	}
+}
+
+func TestStatusCheckUserAgentRespectsImpersonation(t *testing.T) {
+	tests := []struct {
+		name string
+		node storage.Node
+		want string
+	}{
+		{
+			name: "impersonated profile",
+			node: storage.Node{Impersonate: true, ImpersonateProfile: "hills_windows"},
+			want: identity.GetProfile("hills_windows").UserAgent,
+		},
+		{
+			name: "passthrough check",
+			node: storage.Node{Impersonate: false, ImpersonateProfile: "hills_windows"},
+			want: "emby-check/1.0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := statusCheckUserAgent(tt.node); got != tt.want {
+				t.Fatalf("statusCheckUserAgent() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

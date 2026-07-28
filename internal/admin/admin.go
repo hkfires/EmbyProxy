@@ -23,6 +23,7 @@ import (
 	"embyproxy/internal/buildinfo"
 	"embyproxy/internal/capture"
 	"embyproxy/internal/config"
+	"embyproxy/internal/identity"
 	"embyproxy/internal/localtime"
 	"embyproxy/internal/logging"
 	"embyproxy/internal/proxy"
@@ -1116,7 +1117,7 @@ func (h *Handler) checkStatus(ctx context.Context, uid string, body map[string]a
 			names = append(names, node.Name)
 		}
 	}
-	client := &http.Client{Timeout: 8 * time.Second}
+	client := &http.Client{}
 	results := []map[string]any{}
 	for _, name := range names {
 		nm := validators.NormalizeName(name)
@@ -1135,18 +1136,35 @@ func (h *Handler) checkStatus(ctx context.Context, uid string, body map[string]a
 		}
 		checked := fmt.Sprintf("http://127.0.0.1:%d%s/emby/System/Info/Public", h.cfg.Port, proxyPath)
 		started := time.Now()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, checked, nil)
-		req.Header.Set("User-Agent", "emby-proxy-check/1.0")
+		checkCtx, cancel := context.WithTimeout(ctx, statusCheckTimeout(len(storage.SplitTargets(node.Target))))
+		req, _ := http.NewRequestWithContext(checkCtx, http.MethodGet, checked, nil)
+		req.Header.Set("User-Agent", statusCheckUserAgent(*node))
 		res, err := client.Do(req)
 		ms := time.Since(started).Milliseconds()
 		if err != nil {
+			cancel()
 			results = append(results, map[string]any{"name": nm, "target": checked, "checked": checked, "status": 0, "error": errorText(err), "ms": ms})
 			continue
 		}
 		_ = res.Body.Close()
+		cancel()
 		results = append(results, map[string]any{"name": nm, "target": checked, "checked": checked, "status": res.StatusCode, "ms": ms})
 	}
 	return map[string]any{"ok": true, "results": results}
+}
+
+func statusCheckTimeout(targetCount int) time.Duration {
+	if targetCount < 1 {
+		targetCount = 1
+	}
+	return time.Duration(targetCount) * proxy.UpstreamTargetAttemptTimeout
+}
+
+func statusCheckUserAgent(node storage.Node) string {
+	if node.Impersonate {
+		return identity.GetProfile(node.ImpersonateProfile).UserAgent
+	}
+	return "emby-check/1.0"
 }
 
 func (h *Handler) tgSet(ctx context.Context, body map[string]any) map[string]any {

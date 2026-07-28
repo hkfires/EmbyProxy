@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	webSocketDialTimeout      = 15 * time.Second
-	webSocketHandshakeTimeout = 60 * time.Second
+	webSocketDialTimeout      = UpstreamTargetAttemptTimeout
+	webSocketHandshakeTimeout = UpstreamTargetAttemptTimeout
 )
 
 func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, node storage.Node, parsed parsedRoute) {
@@ -55,10 +55,16 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, node s
 			}
 			tried++
 			lastTarget = target
-			if h.tryWebSocketTarget(ctx, w, r, node, parsed, target, targets, expectedActive, requestID, started) {
+			attemptCtx, cancel := context.WithTimeout(ctx, h.targetTimeout())
+			succeeded := h.tryWebSocketTarget(attemptCtx, w, r, node, parsed, target, targets, expectedActive, requestID, started)
+			cancel()
+			if succeeded {
 				return
 			}
 			lastErr = errWebSocketUpgradeFailed
+			if ctx.Err() != nil {
+				break
+			}
 			h.lineBan.Set(banKey, 1, time.Minute)
 		}
 		if tried > 0 {

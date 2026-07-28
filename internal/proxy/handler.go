@@ -47,6 +47,7 @@ type Handler struct {
 	rawDirectClient           *http.Client
 	rawLinkKeyMu              sync.Mutex
 	rawLinkKey                []byte
+	targetAttemptTimeout      time.Duration
 }
 
 const (
@@ -61,6 +62,53 @@ const (
 	upstreamPoolRawDirect           = "rawDirect"
 	upstreamPoolUndefined           = "undefined"
 )
+
+// UpstreamTargetAttemptTimeout limits how long one upstream may take to
+// produce a usable response before failover moves to the next target.
+const UpstreamTargetAttemptTimeout = 15 * time.Second
+
+var errUpstreamTargetAttemptTimeout = errors.New("upstream target attempt timeout")
+
+type targetAttemptTimerContextKey struct{}
+
+type targetAttemptTimer struct {
+	mu      sync.Mutex
+	started bool
+	timer   *time.Timer
+	timeout time.Duration
+	cancel  context.CancelCauseFunc
+}
+
+func (t *targetAttemptTimer) start() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.started {
+		return
+	}
+	t.started = true
+	t.timer = time.AfterFunc(t.timeout, func() {
+		t.cancel(errUpstreamTargetAttemptTimeout)
+	})
+}
+
+func (t *targetAttemptTimer) stop() bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	started := t.started
+	timer := t.timer
+	t.mu.Unlock()
+	return !started || timer.Stop()
+}
+
+func startTargetAttemptTimer(ctx context.Context) {
+	timer, _ := ctx.Value(targetAttemptTimerContextKey{}).(*targetAttemptTimer)
+	timer.start()
+}
 
 type parsedRoute struct {
 	URL      *url.URL
@@ -149,7 +197,7 @@ func newProxyTransport(protectRaw bool) *http.Transport {
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: UpstreamTargetAttemptTimeout,
 		ExpectContinueTimeout: 5 * time.Second,
 	}
 	if protectRaw {
@@ -376,8 +424,14 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 		nodeTry := node
 		nodeTry.Target = target
 		capture.ClearErrorMeta(r)
-		res, err := h.handleOneTarget(ctx, r, nodeTry, parsed, body, env)
+		res, err := h.runTargetAttempt(ctx, func(attemptCtx context.Context) (*http.Response, error) {
+			return h.handleOneTarget(attemptCtx, r, nodeTry, parsed, body, env)
+		})
 		if err != nil {
+			if ctx.Err() != nil {
+				h.closeBody(lastRes)
+				return nil, ctx.Err()
+			}
 			h.lineBan.Set(banKey, 1, time.Minute)
 			attemptMS := time.Since(started).Milliseconds()
 			capture.AppendErrorAttempt(r, "target-attempt", err, map[string]any{"target": logging.RedactURL(target), "targetAttemptMs": attemptMS})
@@ -415,8 +469,14 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 			nodeTry := node
 			nodeTry.Target = target
 			capture.ClearErrorMeta(r)
-			res, err := h.handleOneTarget(ctx, r, nodeTry, parsed, body, env)
+			res, err := h.runTargetAttempt(ctx, func(attemptCtx context.Context) (*http.Response, error) {
+				return h.handleOneTarget(attemptCtx, r, nodeTry, parsed, body, env)
+			})
 			if err != nil {
+				if ctx.Err() != nil {
+					h.closeBody(lastRes)
+					return nil, ctx.Err()
+				}
 				attemptMS := time.Since(started).Milliseconds()
 				lastErr = err
 				lastAttemptMS = attemptMS
@@ -452,6 +512,58 @@ func (h *Handler) handleNode(ctx context.Context, r *http.Request, node storage.
 		return nil, lastErr
 	}
 	return textResponse(http.StatusBadGateway, "Bad Gateway", nil), nil
+}
+
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelCauseFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel(nil)
+	return err
+}
+
+func (h *Handler) targetTimeout() time.Duration {
+	if h != nil && h.targetAttemptTimeout > 0 {
+		return h.targetAttemptTimeout
+	}
+	return UpstreamTargetAttemptTimeout
+}
+
+func (h *Handler) runTargetAttempt(ctx context.Context, fetch func(context.Context) (*http.Response, error)) (*http.Response, error) {
+	attemptCtx, cancel := context.WithCancelCause(ctx)
+	timer := &targetAttemptTimer{timeout: h.targetTimeout(), cancel: cancel}
+	attemptCtx = context.WithValue(attemptCtx, targetAttemptTimerContextKey{}, timer)
+
+	res, err := fetch(attemptCtx)
+	if err != nil {
+		timer.stop()
+		cause := context.Cause(attemptCtx)
+		cancel(err)
+		if errors.Is(cause, errUpstreamTargetAttemptTimeout) {
+			return res, errUpstreamTargetAttemptTimeout
+		}
+		return res, err
+	}
+	if !timer.stop() {
+		h.closeBody(res)
+		cancel(errUpstreamTargetAttemptTimeout)
+		return nil, errUpstreamTargetAttemptTimeout
+	}
+	if res == nil || res.Body == nil {
+		cancel(nil)
+		return res, nil
+	}
+	if source := streamResumeSource(res); source != "" && res.Request != nil {
+		client := upstreamClientForResponse(res)
+		res.Request = res.Request.WithContext(ctx)
+		attachUpstreamClient(res, client)
+		markStreamResumeCandidate(res, source)
+	}
+	res.Body = &cancelOnCloseBody{ReadCloser: res.Body, cancel: cancel}
+	return res, nil
 }
 
 func (h *Handler) handleOneTarget(ctx context.Context, r *http.Request, node storage.Node, parsed parsedRoute, body []byte, env config.ProxyEnv) (*http.Response, error) {
@@ -916,6 +1028,7 @@ func bodyCopyIssueSide(copyErr, ctxErr error, reader *bodyCopyReader, writer *bo
 }
 
 func (h *Handler) doFetch(ctx context.Context, client *http.Client, target *url.URL, method string, headers http.Header, body []byte) (*http.Response, error) {
+	startTargetAttemptTimer(ctx)
 	if pool := h.upstreamPoolName(client); pool != "" {
 		SetAccessLogField(ctx, accessLogFieldUpstreamPool, pool)
 	}

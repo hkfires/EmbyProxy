@@ -694,15 +694,25 @@ func TestSendResponseResumesInterruptedPlaybackStream(t *testing.T) {
 		Body:    body,
 		Request: upstreamReq,
 	}
-	attachUpstreamClient(res, client)
-	markStreamResumeCandidate(res, "playback")
-	if _, ok := (&Handler{}).streamResumePlan(req, res); !ok {
+	h := &Handler{log: logging.New("silent", false), targetAttemptTimeout: time.Second}
+	wrappedRes, err := h.runTargetAttempt(ctx, func(attemptCtx context.Context) (*http.Response, error) {
+		res.Request = res.Request.WithContext(attemptCtx)
+		attachUpstreamClient(res, client)
+		markStreamResumeCandidate(res, "playback")
+		startTargetAttemptTimer(attemptCtx)
+		return res, nil
+	})
+	if err != nil {
+		t.Fatalf("runTargetAttempt() error = %v", err)
+	}
+	res = wrappedRes
+	if _, ok := h.streamResumePlan(req, res); !ok {
 		validator, hasValidator := newStreamResumeValidator(res.Header)
 		t.Fatalf("streamResumePlan disabled: source=%q client=%v media=%v accepts=%v validator=%v hasValidator=%v range=%q contentRange=%q", streamResumeSource(res), upstreamClientForResponse(res), streamResumeResponseLooksLikeMedia(res), streamResumeAcceptsBytes(res.Header), validator, hasValidator, res.Request.Header.Get("Range"), res.Header.Get("Content-Range"))
 	}
 	rec := httptest.NewRecorder()
 
-	(&Handler{log: logging.New("silent", false)}).sendResponse(rec, req, res)
+	h.sendResponse(rec, req, res)
 
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
@@ -1605,6 +1615,130 @@ func TestHandleNodeStoresTargetDurationForAccessLog(t *testing.T) {
 
 	if _, ok := AccessLogFields(ctx)["responseReadyMs"].(int64); !ok {
 		t.Fatalf("responseReadyMs access log field = %T, want int64", AccessLogFields(ctx)["responseReadyMs"])
+	}
+}
+
+func TestHandleNodeFailsOverAfterPerTargetTimeout(t *testing.T) {
+	store := newProxyTestStore(t)
+	h := New(config.Config{}, store, nil, logging.New("silent", false))
+	h.targetAttemptTimeout = 25 * time.Millisecond
+	var hosts []string
+	var hostsMu sync.Mutex
+	h.noRedirectClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		hostsMu.Lock()
+		hosts = append(hosts, req.URL.Host)
+		hostsMu.Unlock()
+		if req.URL.Host != "good.example" {
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}
+		return bytesResponse(http.StatusOK, []byte("ok"), http.Header{"Content-Type": []string{"text/plain"}}), nil
+	})}
+
+	node := storage.Node{
+		Name:   "node",
+		Target: "https://bad-one.example\nhttps://bad-two.example\nhttps://good.example",
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://proxy.example/node/emby/System/Ping", nil)
+	res, err := h.handleNode(context.Background(), req, node, parsedRoute{Name: "node", Path: "/emby/System/Ping"}, nil, config.ProxyEnv{})
+	if err != nil {
+		t.Fatalf("handleNode() error = %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.StatusCode)
+	}
+
+	hostsMu.Lock()
+	gotHosts := strings.Join(hosts, ",")
+	hostsMu.Unlock()
+	if want := "bad-one.example,bad-two.example,good.example"; gotHosts != want {
+		t.Fatalf("attempted hosts = %q, want %q", gotHosts, want)
+	}
+	if got := h.getActiveTarget("admin:node", storage.SplitTargets(node.Target)); got != "https://good.example" {
+		t.Fatalf("active target = %q, want good target", got)
+	}
+}
+
+func TestHandleNodeDoesNotBanOrContinueAfterClientCancellation(t *testing.T) {
+	store := newProxyTestStore(t)
+	h := New(config.Config{}, store, nil, logging.New("silent", false))
+	h.targetAttemptTimeout = time.Second
+	var hosts []string
+	var hostsMu sync.Mutex
+	h.noRedirectClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		hostsMu.Lock()
+		hosts = append(hosts, req.URL.Host)
+		hostsMu.Unlock()
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(25*time.Millisecond, cancel)
+	node := storage.Node{Name: "node", Target: "https://first.example\nhttps://second.example"}
+	req := httptest.NewRequest(http.MethodGet, "https://proxy.example/node/emby/System/Ping", nil).WithContext(ctx)
+	res, err := h.handleNode(ctx, req, node, parsedRoute{Name: "node", Path: "/emby/System/Ping"}, nil, config.ProxyEnv{})
+	if res != nil {
+		defer res.Body.Close()
+		t.Fatalf("response status = %d, want nil response", res.StatusCode)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("handleNode() error = %v, want context canceled", err)
+	}
+
+	hostsMu.Lock()
+	gotHosts := strings.Join(hosts, ",")
+	hostsMu.Unlock()
+	if gotHosts != "first.example" {
+		t.Fatalf("attempted hosts = %q, want only first target", gotHosts)
+	}
+	for _, target := range storage.SplitTargets(node.Target) {
+		if _, banned := h.lineBan.Get("admin:node|" + target); banned {
+			t.Fatalf("target %q was banned after client cancellation", target)
+		}
+	}
+}
+
+func TestRunTargetAttemptKeepsSuccessfulResponseAliveUntilBodyClose(t *testing.T) {
+	h := &Handler{targetAttemptTimeout: 25 * time.Millisecond}
+	var attemptCtx context.Context
+	res, err := h.runTargetAttempt(context.Background(), func(ctx context.Context) (*http.Response, error) {
+		attemptCtx = ctx
+		startTargetAttemptTimer(ctx)
+		return bytesResponse(http.StatusOK, []byte("ok"), nil), nil
+	})
+	if err != nil {
+		t.Fatalf("runTargetAttempt() error = %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-attemptCtx.Done():
+		t.Fatalf("successful attempt context ended before body close: %v", context.Cause(attemptCtx))
+	default:
+	}
+	if err := res.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-attemptCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("attempt context stayed alive after body close")
+	}
+}
+
+func TestRunTargetAttemptDoesNotCountLocalWorkAgainstUpstreamTimeout(t *testing.T) {
+	h := &Handler{targetAttemptTimeout: 25 * time.Millisecond}
+	res, err := h.runTargetAttempt(context.Background(), func(context.Context) (*http.Response, error) {
+		time.Sleep(50 * time.Millisecond)
+		return bytesResponse(http.StatusOK, []byte("ok"), nil), nil
+	})
+	if err != nil {
+		t.Fatalf("runTargetAttempt() error = %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.StatusCode)
 	}
 }
 
