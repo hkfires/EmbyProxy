@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"container/list"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -18,18 +19,22 @@ import (
 )
 
 type Store struct {
-	db              *sql.DB
-	mu              sync.RWMutex
-	nodeCache       map[string]cacheEntry[*Node]
-	nodeListCache   map[string]cacheEntry[[]Node]
-	hostIndexCache  map[string]cacheEntry[map[string]HostMatch]
-	sysConfigCache  systemConfigCacheEntry
-	sysConfigGen    uint64
-	playbackMu      sync.RWMutex
-	playbackClosed  bool
-	playbackQueue   chan PlaybackInput
-	playbackWG      sync.WaitGroup
-	playbackDropped uint64
+	db                *sql.DB
+	mu                sync.RWMutex
+	nodeCache         map[string]cacheEntry[*Node]
+	negativeNodeMu    sync.Mutex
+	negativeNodeCache map[string]*list.Element
+	negativeNodeOrder *list.List
+	nodeListCache     map[string]cacheEntry[[]Node]
+	hostIndexCache    map[string]cacheEntry[map[string]HostMatch]
+	sysConfigCache    systemConfigCacheEntry
+	sysConfigGen      uint64
+	nodeCacheGen      uint64
+	playbackMu        sync.RWMutex
+	playbackClosed    bool
+	playbackQueue     chan PlaybackInput
+	playbackWG        sync.WaitGroup
+	playbackDropped   uint64
 }
 
 type KV struct {
@@ -47,7 +52,16 @@ type systemConfigCacheEntry struct {
 	exp   time.Time
 }
 
-const systemConfigCacheTTL = 5 * time.Second
+const (
+	systemConfigCacheTTL      = 5 * time.Second
+	nodeCacheTTL              = 10 * time.Second
+	negativeNodeCacheCapacity = 4096
+)
+
+type negativeNodeCacheEntry struct {
+	key string
+	exp time.Time
+}
 
 type ListResult struct {
 	Keys         []string
@@ -69,10 +83,12 @@ func New(dbPath string) (*Store, error) {
 		return nil, err
 	}
 	store := &Store{
-		db:             db,
-		nodeCache:      map[string]cacheEntry[*Node]{},
-		nodeListCache:  map[string]cacheEntry[[]Node]{},
-		hostIndexCache: map[string]cacheEntry[map[string]HostMatch]{},
+		db:                db,
+		nodeCache:         map[string]cacheEntry[*Node]{},
+		negativeNodeCache: map[string]*list.Element{},
+		negativeNodeOrder: list.New(),
+		nodeListCache:     map[string]cacheEntry[[]Node]{},
+		hostIndexCache:    map[string]cacheEntry[map[string]HostMatch]{},
 	}
 	if err := store.InitSchema(context.Background()); err != nil {
 		_ = db.Close()
@@ -309,21 +325,50 @@ func (s *Store) GetNode(ctx context.Context, uid, name string) (*Node, error) {
 	if node, ok := s.getNodeCache(cacheKey); ok {
 		return node, nil
 	}
+	if s.getNegativeNodeCache(cacheKey) {
+		return nil, nil
+	}
+	nodeCacheGen := s.nodeCacheGeneration()
 	packed, ok, err := s.KV().Get(ctx, "u:"+uid+":node:"+name)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		s.setNodeCache(cacheKey, nil, 10*time.Second)
+		s.setNegativeNodeCacheIfGeneration(cacheKey, nodeCacheTTL, nodeCacheGen)
 		return nil, nil
 	}
 	node, valid := UnpackNode(name, packed)
 	if !valid {
-		s.setNodeCache(cacheKey, nil, 10*time.Second)
+		s.setNegativeNodeCacheIfGeneration(cacheKey, nodeCacheTTL, nodeCacheGen)
 		return nil, nil
 	}
-	s.setNodeCache(cacheKey, &node, 10*time.Second)
+	s.setNodeCacheIfGeneration(cacheKey, &node, nodeCacheTTL, nodeCacheGen)
 	return &node, nil
+}
+
+// CleanupNodeCache removes expired positive and negative node cache entries.
+func (s *Store) CleanupNodeCache() {
+	if s == nil {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	for key, entry := range s.nodeCache {
+		if now.After(entry.exp) {
+			delete(s.nodeCache, key)
+		}
+	}
+	s.mu.Unlock()
+
+	s.negativeNodeMu.Lock()
+	defer s.negativeNodeMu.Unlock()
+	for key, element := range s.negativeNodeCache {
+		entry, ok := element.Value.(negativeNodeCacheEntry)
+		if !ok || now.After(entry.exp) {
+			delete(s.negativeNodeCache, key)
+			s.negativeNodeOrder.Remove(element)
+		}
+	}
 }
 
 func (s *Store) ListNodes(ctx context.Context, uid string) ([]Node, error) {
@@ -396,11 +441,20 @@ func (s *Store) DeleteNode(ctx context.Context, uid, name string) error {
 
 func (s *Store) InvalidateNodeCache(uid, name string) {
 	name = strings.ToLower(strings.TrimSpace(name))
+	key := uid + ":" + name
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.nodeCache, uid+":"+name)
+	s.nodeCacheGen++
+	delete(s.nodeCache, key)
 	delete(s.nodeListCache, "list:"+uid)
 	delete(s.hostIndexCache, "hostidx:"+uid)
+	s.mu.Unlock()
+
+	s.negativeNodeMu.Lock()
+	defer s.negativeNodeMu.Unlock()
+	if element, ok := s.negativeNodeCache[key]; ok {
+		delete(s.negativeNodeCache, key)
+		s.negativeNodeOrder.Remove(element)
+	}
 }
 
 func (s *Store) GetHostIndex(ctx context.Context, uid string) (map[string]HostMatch, error) {
@@ -523,15 +577,81 @@ func (s *Store) getNodeCache(key string) (*Node, bool) {
 	return &node, true
 }
 
-func (s *Store) setNodeCache(key string, value *Node, ttl time.Duration) {
+func (s *Store) nodeCacheGeneration() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.nodeCacheGen
+}
+
+func (s *Store) setNodeCacheIfGeneration(key string, value *Node, ttl time.Duration, generation uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.nodeCacheGen != generation {
+		return false
+	}
 	if value == nil {
 		s.nodeCache[key] = cacheEntry[*Node]{value: nil, exp: time.Now().Add(ttl)}
-		return
+		return true
 	}
 	node := *value
 	s.nodeCache[key] = cacheEntry[*Node]{value: &node, exp: time.Now().Add(ttl)}
+	return true
+}
+
+func (s *Store) getNegativeNodeCache(key string) bool {
+	now := time.Now()
+	s.negativeNodeMu.Lock()
+	defer s.negativeNodeMu.Unlock()
+	element, ok := s.negativeNodeCache[key]
+	if !ok {
+		return false
+	}
+	entry, valid := element.Value.(negativeNodeCacheEntry)
+	if !valid || now.After(entry.exp) {
+		delete(s.negativeNodeCache, key)
+		s.negativeNodeOrder.Remove(element)
+		return false
+	}
+	s.negativeNodeOrder.MoveToFront(element)
+	return true
+}
+
+func (s *Store) setNegativeNodeCache(key string, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	now := time.Now()
+	s.negativeNodeMu.Lock()
+	defer s.negativeNodeMu.Unlock()
+	if element, ok := s.negativeNodeCache[key]; ok {
+		element.Value = negativeNodeCacheEntry{key: key, exp: now.Add(ttl)}
+		s.negativeNodeOrder.MoveToFront(element)
+		return
+	}
+	element := s.negativeNodeOrder.PushFront(negativeNodeCacheEntry{key: key, exp: now.Add(ttl)})
+	s.negativeNodeCache[key] = element
+	for len(s.negativeNodeCache) > negativeNodeCacheCapacity {
+		oldest := s.negativeNodeOrder.Back()
+		if oldest == nil {
+			break
+		}
+		entry, _ := oldest.Value.(negativeNodeCacheEntry)
+		delete(s.negativeNodeCache, entry.key)
+		s.negativeNodeOrder.Remove(oldest)
+	}
+}
+
+func (s *Store) setNegativeNodeCacheIfGeneration(key string, ttl time.Duration, generation uint64) bool {
+	if ttl <= 0 {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.nodeCacheGen != generation {
+		return false
+	}
+	s.setNegativeNodeCache(key, ttl)
+	return true
 }
 
 func (s *Store) getListCache(key string) ([]Node, bool) {

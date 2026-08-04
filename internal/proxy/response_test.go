@@ -1564,6 +1564,19 @@ func TestRawHTTPClientUsesProtectedDirectDialer(t *testing.T) {
 	}
 }
 
+func TestServeHTTPRejectsOversizedRequestBody(t *testing.T) {
+	h := newProxyTestHandler(t, storage.Node{Name: "node", Secret: "secret"})
+	h.cfg.Defaults.MaxRetryBodyBytes = 4
+
+	req := httptest.NewRequest(http.MethodPost, "https://proxy.example/node/secret/emby/System/Ping", strings.NewReader("12345"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
 func TestReadProxyRewriteBodyRejectsOversizedBody(t *testing.T) {
 	_, err := readProxyRewriteBody(io.LimitReader(repeatingReader{}, proxyRewriteBodyMaxBytes+1))
 	if !errors.Is(err, errProxyRewriteBodyTooLarge) {

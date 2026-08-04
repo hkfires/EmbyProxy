@@ -341,6 +341,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := h.requestBodyForReplay(w, r)
 	if err != nil {
+		if errors.Is(err, capture.ErrRequestBodyTooLarge) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "Request body error", http.StatusBadRequest)
 		return
 	}
@@ -361,6 +365,7 @@ func (h *Handler) CleanupTTLMaps() {
 		imageCache.CleanupExpired()
 	}
 	if h.store != nil {
+		h.store.CleanupNodeCache()
 		_ = h.store.PrunePlayBuckets(context.Background(), 3)
 		_ = h.store.PrunePlaybackStates(context.Background(), 24*time.Hour)
 	}

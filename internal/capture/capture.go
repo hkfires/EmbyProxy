@@ -33,6 +33,9 @@ import (
 
 type contextKey struct{}
 
+// ErrRequestBodyTooLarge reports that the request exceeded the replay buffer limit.
+var ErrRequestBodyTooLarge = errors.New("request body exceeds replay limit")
+
 type Recorder struct {
 	cfg   config.Config
 	store *storage.Store
@@ -785,15 +788,20 @@ func DrainAndRemember(req *http.Request, max int64) ([]byte, error) {
 	if req.Body == nil {
 		return nil, nil
 	}
-	var reader io.Reader = req.Body
+	originalBody := req.Body
+	defer originalBody.Close()
+	var reader io.Reader = originalBody
 	if max > 0 {
-		reader = io.LimitReader(req.Body, max+1)
+		reader = io.LimitReader(originalBody, max+1)
 	}
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
 	}
-	_ = req.Body.Close()
+	if max > 0 && int64(len(body)) > max {
+		req.Body = http.NoBody
+		return nil, ErrRequestBodyTooLarge
+	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	RememberRequestBody(req, body)
 	return body, nil

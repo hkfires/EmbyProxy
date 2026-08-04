@@ -43,6 +43,24 @@ func TestCaptureFilePathStaysWithinDataDirectory(t *testing.T) {
 	}
 }
 
+func TestDrainAndRememberRejectsOversizedBody(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "http://proxy.example/", bytes.NewReader([]byte("12345")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := DrainAndRemember(req, 4)
+	if !errors.Is(err, ErrRequestBodyTooLarge) {
+		t.Fatalf("DrainAndRemember() error = %v, want ErrRequestBodyTooLarge", err)
+	}
+	if body != nil {
+		t.Fatalf("DrainAndRemember() body = %d bytes, want nil", len(body))
+	}
+	if req.Body != http.NoBody {
+		t.Fatal("request body should be replaced with http.NoBody after rejection")
+	}
+}
+
 func TestInboundHeadersToMapIncludesRequestFields(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "http://proxy.example/emby", strings.NewReader("body"))
 	if err != nil {
