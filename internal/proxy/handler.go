@@ -1046,6 +1046,9 @@ func (h *Handler) doFetch(ctx context.Context, client *http.Client, target *url.
 		return nil, err
 	}
 	req.Header = cloneHeader(headers)
+	if _, ok := req.Header["User-Agent"]; !ok {
+		req.Header["User-Agent"] = nil
+	}
 	req.Host = target.Host
 	res, err := client.Do(req)
 	if err != nil {

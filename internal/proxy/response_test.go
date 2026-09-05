@@ -4349,12 +4349,15 @@ func assertHillsOutboundHeaderIdentityApplied(t *testing.T, ids *identity.Manage
 	if got := req.Header.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="`+snap.ClientName+`"`) {
 		t.Fatalf("X-Emby-Authorization header = %q, want Hills identity", got)
 	}
+	if got := req.Header.Get("X-Emby-Client"); got != snap.ClientName {
+		t.Fatalf("X-Emby-Client header = %q, want %q", got, snap.ClientName)
+	}
 	if got := req.Header.Get("X-Emby-Token"); got != token {
 		t.Fatalf("X-Emby-Token header = %q, want %q", got, token)
 	}
 	assertHeadersAbsent(t, req.Header,
 		"Authorization", "X-Authorization",
-		"X-Emby-Client", "X-MediaBrowser-Client",
+		"X-MediaBrowser-Client",
 	)
 }
 

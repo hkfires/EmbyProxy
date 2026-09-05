@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -134,13 +135,86 @@ func deleteHeaders(h http.Header, keys ...string) {
 	}
 }
 
-func setProxyUA(ids *identity.Manager, h http.Header, node storage.Node) {
-	ua := strings.TrimSpace(h.Get("User-Agent"))
-	if node.Impersonate {
-		ua = ids.Snapshot(node.ImpersonateProfile).UserAgent
+var embyAuthorizationClientRE = regexp.MustCompile(`(?i)\bClient\s*=\s*("[^"]*"|[^,\s]+)`)
+
+func extractClientFromAuth(auth string) string {
+	matches := embyAuthorizationClientRE.FindStringSubmatch(strings.TrimSpace(auth))
+	if len(matches) < 2 {
+		return ""
 	}
+	val := strings.TrimSpace(matches[1])
+	if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+		val = val[1 : len(val)-1]
+		val = strings.ReplaceAll(val, `\"`, `"`)
+		val = strings.ReplaceAll(val, `\\`, `\`)
+	}
+	return strings.TrimSpace(val)
+}
+
+func hasClientHeader(h http.Header) bool {
+	if h == nil {
+		return false
+	}
+	for key, values := range h {
+		nk := strings.NewReplacer("-", "", "_", "").Replace(strings.ToLower(key))
+		if nk == "xembyclient" || nk == "xmediabrowserclient" {
+			for _, v := range values {
+				if strings.TrimSpace(v) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func fillMissingClientFromAuth(h http.Header) {
+	if hasClientHeader(h) {
+		return
+	}
+	for _, key := range []string{"X-Emby-Authorization", "X-MediaBrowser-Authorization", "Authorization", "X-Authorization"} {
+		for _, authVal := range h.Values(key) {
+			if client := extractClientFromAuth(authVal); client != "" {
+				h.Set("X-Emby-Client", client)
+				return
+			}
+		}
+	}
+}
+
+func fillMissingClientFromQuery(u *url.URL, h http.Header) {
+	if u == nil || hasClientHeader(h) {
+		return
+	}
+	fillMissingClientFromAuth(h)
+	if hasClientHeader(h) {
+		return
+	}
+	for key, values := range u.Query() {
+		nk := strings.NewReplacer("-", "", "_", "").Replace(strings.ToLower(key))
+		if nk == "client" || nk == "xembyclient" || nk == "xmediabrowserclient" {
+			for _, v := range values {
+				if strings.TrimSpace(v) != "" {
+					h.Set("X-Emby-Client", strings.TrimSpace(v))
+					return
+				}
+			}
+		}
+	}
+}
+
+func setProxyUA(ids *identity.Manager, h http.Header, node storage.Node) {
+	if node.Impersonate {
+		ua := ids.Snapshot(node.ImpersonateProfile).UserAgent
+		if ua == "Yamby/2.0.4.6(Android" {
+			ua = "Yamby/2.0.4.6(Android)"
+		}
+		h.Set("User-Agent", ua)
+		return
+	}
+	ua := strings.TrimSpace(h.Get("User-Agent"))
 	if ua == "" {
-		h.Del("User-Agent")
+		h["User-Agent"] = nil
 		return
 	}
 	h.Set("User-Agent", ua)
@@ -148,25 +222,39 @@ func setProxyUA(ids *identity.Manager, h http.Header, node storage.Node) {
 
 func applyIdentity(ids *identity.Manager, h http.Header, node storage.Node) {
 	if node.Impersonate {
-		ids.ApplyToHeaders(h, node.ImpersonateProfile)
+		ids.ApplyToHeaders(h, node.ImpersonateProfile, node.Secret)
+		return
 	}
+	fillMissingClientFromAuth(h)
 }
 
 func applyIdentityToURL(ids *identity.Manager, u *url.URL, headers http.Header, node storage.Node) {
 	if node.Impersonate {
-		ids.ApplyToURL(u, headers, node.ImpersonateProfile)
+		ids.ApplyToURL(u, headers, node.ImpersonateProfile, node.Secret)
+		return
+	}
+	if u != nil && headers != nil {
+		fillMissingClientFromQuery(u, headers)
 	}
 }
 
 func applyIdentityToResourceURL(ids *identity.Manager, u *url.URL, headers http.Header, node storage.Node) {
 	if node.Impersonate {
-		ids.ApplyToResourceURL(u, headers, node.ImpersonateProfile)
+		ids.ApplyToResourceURL(u, headers, node.ImpersonateProfile, node.Secret)
+		return
+	}
+	if u != nil && headers != nil {
+		fillMissingClientFromQuery(u, headers)
 	}
 }
 
 func applyIdentityToDirectURL(ids *identity.Manager, u *url.URL, headers http.Header, node storage.Node) {
 	if node.Impersonate {
-		ids.ApplyToDirectURL(u, headers, node.ImpersonateProfile)
+		ids.ApplyToDirectURL(u, headers, node.ImpersonateProfile, node.Secret)
+		return
+	}
+	if u != nil && headers != nil {
+		fillMissingClientFromQuery(u, headers)
 	}
 }
 
@@ -180,6 +268,9 @@ func buildCleanProxyHeaders(ids *identity.Manager, raw http.Header, targetURL *u
 	h.Set("Host", targetURL.Host)
 	setProxyUA(ids, h, node)
 	applyIdentity(ids, h, node)
+	if !node.Impersonate && targetURL != nil {
+		fillMissingClientFromQuery(targetURL, h)
+	}
 	if rg := raw.Get("Range"); rg != "" {
 		h.Set("Range", rg)
 	}
@@ -203,6 +294,9 @@ func buildDirectOutboundHeaders(ids *identity.Manager, raw http.Header, targetUR
 	h.Set("Host", targetURL.Host)
 	setProxyUA(ids, h, node)
 	applyIdentity(ids, h, node)
+	if !node.Impersonate && targetURL != nil {
+		fillMissingClientFromQuery(targetURL, h)
+	}
 	if rg := raw.Get("Range"); rg != "" {
 		h.Set("Range", rg)
 	}

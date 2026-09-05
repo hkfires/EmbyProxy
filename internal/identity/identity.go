@@ -2,7 +2,9 @@ package identity
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -53,10 +55,11 @@ type persisted struct {
 }
 
 type Manager struct {
-	store       *storage.Store
-	mu          sync.Mutex
-	profiles    map[string]deviceState
-	initialized bool
+	store        *storage.Store
+	mu           sync.Mutex
+	profiles     map[string]deviceState
+	initialized  bool
+	tokenAliases map[string]string
 }
 
 var Profiles = map[string]Profile{
@@ -67,7 +70,7 @@ var Profiles = map[string]Profile{
 		ClientVersion:  "2.0.4.6",
 		DeviceName:     "Android",
 		DeviceIDFormat: "uuid",
-		UserAgent:      "Yamby/2.0.4.6(Android",
+		UserAgent:      "Yamby/2.0.4.6(Android)",
 	},
 	"hills_android": {
 		Key:            "hills_android",
@@ -91,13 +94,15 @@ var Profiles = map[string]Profile{
 var ProfileOrder = []string{DefaultProfile, "hills_android", "hills_windows"}
 
 var (
-	embyAuthorizationRE      = regexp.MustCompile(`(?i)^(?:MediaBrowser|Emby)(?:\s|$)`)
-	embyAuthorizationTokenRE = regexp.MustCompile(`(?i)^(?:MediaBrowser|Emby)(?:\s|$).*?\bToken\s*=\s*("[^"]*"|[^,\s]+)`)
-	authorizationHeaderKeys  = []string{"X-Emby-Authorization", "X-MediaBrowser-Authorization", "Authorization", "X-Authorization"}
+	embyAuthorizationRE         = regexp.MustCompile(`(?i)^(?:MediaBrowser|Emby)(?:\s|$)`)
+	embyAuthorizationTokenRE    = regexp.MustCompile(`(?i)^(?:MediaBrowser|Emby)(?:\s|$).*?\bToken\s*=\s*("[^"]*"|[^,\s]+)`)
+	embyAuthorizationDeviceIDRE = regexp.MustCompile(`(?i)\bDeviceId\s*=\s*("[^"]*"|[^,\s]+)`)
+	embyAuthorizationClientRE   = regexp.MustCompile(`(?i)\bClient\s*=\s*("[^"]*"|[^,\s]+)`)
+	authorizationHeaderKeys     = []string{"X-Emby-Authorization", "X-MediaBrowser-Authorization", "Authorization", "X-Authorization"}
 )
 
 func NewManager(store *storage.Store) *Manager {
-	return &Manager{store: store, profiles: map[string]deviceState{}}
+	return &Manager{store: store, profiles: map[string]deviceState{}, tokenAliases: map[string]string{}}
 }
 
 func (m *Manager) Init(ctx context.Context) error {
@@ -128,6 +133,10 @@ func (m *Manager) snapshotLocked(profile string) Snapshot {
 	if len(shortID) > 8 {
 		shortID = shortID[:8]
 	}
+	ua := selected.UserAgent
+	if ua == "Yamby/2.0.4.6(Android" {
+		ua = "Yamby/2.0.4.6(Android)"
+	}
 	return Snapshot{
 		Profile:       selected.Key,
 		Label:         selected.Label,
@@ -136,27 +145,157 @@ func (m *Manager) snapshotLocked(profile string) Snapshot {
 		DeviceName:    state.DeviceName,
 		DeviceID:      state.DeviceID,
 		ShortID:       shortID,
-		UserAgent:     selected.UserAgent,
+		UserAgent:     ua,
 	}
 }
 
-func (m *Manager) ApplyToHeaders(headers http.Header, profile string) {
-	snap := m.Snapshot(profile)
-	applyProfileIdentityToHeaders(headers, snap)
+func (m *Manager) RememberTokenDeviceID(token, deviceID string) {
+	token = strings.TrimSpace(token)
+	deviceID = strings.TrimSpace(deviceID)
+	if token == "" || deviceID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tokenAliases == nil {
+		m.tokenAliases = make(map[string]string)
+	}
+	if len(m.tokenAliases) > 10000 {
+		m.tokenAliases = make(map[string]string)
+	}
+	m.tokenAliases[token] = deviceID
 }
 
-func applyProfileIdentityToHeaders(headers http.Header, snap Snapshot) {
+func (m *Manager) LookupTokenDeviceID(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tokenAliases == nil {
+		return ""
+	}
+	return m.tokenAliases[token]
+}
+
+func DeriveDeviceID(secret, profileKey, inboundDeviceID string, p Profile) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(profileKey + "\x00" + inboundDeviceID))
+	sum := mac.Sum(nil)
+
+	switch strings.ToLower(strings.TrimSpace(p.DeviceIDFormat)) {
+	case "uuid":
+		buf := make([]byte, 16)
+		copy(buf, sum[:16])
+		buf[6] = (buf[6] & 0x0f) | 0x40 // Version 4
+		buf[8] = (buf[8] & 0x3f) | 0x80 // RFC 4122 variant
+		hexed := hex.EncodeToString(buf)
+		return hexed[:8] + "-" + hexed[8:12] + "-" + hexed[12:16] + "-" + hexed[16:20] + "-" + hexed[20:]
+	default:
+		length := p.DeviceIDLength
+		if length <= 0 {
+			length = 32
+		}
+		hexed := hex.EncodeToString(sum)
+		if len(hexed) > length {
+			return hexed[:length]
+		}
+		return hexed
+	}
+}
+
+func inboundDeviceIDFromAuth(auth string) string {
+	matches := embyAuthorizationDeviceIDRE.FindStringSubmatch(strings.TrimSpace(auth))
+	if len(matches) < 2 {
+		return ""
+	}
+	return unquoteAuthFieldValue(matches[1])
+}
+
+func InboundDeviceIDFromHeaders(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	if id := firstSanitizedToken(
+		firstHeaderValue(headers, "X-Emby-Device-Id"),
+		firstHeaderValue(headers, "X-MediaBrowser-DeviceId"),
+		firstHeaderValueByNormalizedKey(headers, "xembydeviceid"),
+		firstHeaderValueByNormalizedKey(headers, "xmediabrowserdeviceid"),
+	); id != "" {
+		return id
+	}
+	for _, key := range authorizationHeaderKeys {
+		if id := inboundDeviceIDFromAuth(firstHeaderValue(headers, key)); id != "" {
+			return id
+		}
+	}
+	for key, values := range headers {
+		if !isAuthorizationKey(normalizeHeaderKey(key)) {
+			continue
+		}
+		for _, value := range values {
+			if id := inboundDeviceIDFromAuth(value); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func (m *Manager) ResolveOutboundDeviceID(secret string, snap Snapshot, inboundDeviceID, token string) string {
+	p := GetProfile(snap.Profile)
+	inboundDeviceID = strings.TrimSpace(inboundDeviceID)
+	token = strings.TrimSpace(token)
+
+	if inboundDeviceID != "" {
+		outboundID := DeriveDeviceID(secret, snap.Profile, inboundDeviceID, p)
+		if token != "" {
+			m.RememberTokenDeviceID(token, outboundID)
+		}
+		return outboundID
+	}
+
+	if token != "" {
+		if cached := m.LookupTokenDeviceID(token); cached != "" {
+			return cached
+		}
+	}
+
+	return snap.DeviceID
+}
+
+func (m *Manager) ApplyToHeaders(headers http.Header, profile string, secret ...string) {
+	snap := m.Snapshot(profile)
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
+	m.applyProfileIdentityToHeaders(headers, snap, sec)
+}
+
+func (m *Manager) applyProfileIdentityToHeaders(headers http.Header, snap Snapshot, secret string) {
 	if headers == nil {
 		return
 	}
 	token := identityTokenFromHeaders(headers)
-	auth := firstEmbyAuthorizationHeader(headers)
+	inboundDeviceID := InboundDeviceIDFromHeaders(headers)
+	outboundDeviceID := m.ResolveOutboundDeviceID(secret, snap, inboundDeviceID, token)
+
 	stripImpersonationHeaders(headers)
-	switch {
-	case usesHillsAuthFormat(snap):
-		headers.Set("X-Emby-Authorization", buildHillsAuthorization(snap))
-	case auth != "":
-		headers.Set("X-Emby-Authorization", buildYambyAuthorization(auth, snap))
+
+	currentSnap := snap
+	currentSnap.DeviceID = outboundDeviceID
+
+	headers.Set("X-Emby-Client", currentSnap.ClientName)
+	headers.Set("X-Emby-Client-Version", currentSnap.ClientVersion)
+	headers.Set("X-Emby-Device-Name", currentSnap.DeviceName)
+	headers.Set("X-Emby-Device-Id", currentSnap.DeviceID)
+
+	if usesHillsAuthFormat(currentSnap) {
+		headers.Set("X-Emby-Authorization", buildHillsAuthorization(currentSnap))
+	} else {
+		headers.Set("X-Emby-Authorization", buildYambyAuthorization("", currentSnap))
 	}
 	if token != "" {
 		headers.Set("X-Emby-Token", token)
@@ -200,50 +339,90 @@ func deleteHeaderKey(headers http.Header, key string) {
 	headers.Del(key)
 }
 
-func (m *Manager) ApplyToURL(u *url.URL, headers http.Header, profile string) {
+func (m *Manager) ApplyToURL(u *url.URL, headers http.Header, profile string, secret ...string) {
 	if u == nil {
 		return
 	}
 	snap := m.Snapshot(profile)
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
 	if usesYambyAuthFormat(snap) {
+		inboundDeviceID := firstSanitizedToken(
+			firstQueryValueByNormalizedKey(u, "xembydeviceid"),
+			firstQueryValueByNormalizedKey(u, "xmediabrowserdeviceid"),
+			firstQueryValueByNormalizedKey(u, "deviceid"),
+		)
+		token := firstSanitizedToken(
+			firstQueryValueByNormalizedKey(u, "xembytoken"),
+			firstQueryValueByNormalizedKey(u, "xmediabrowsertoken"),
+			firstQueryValueByNormalizedKey(u, "apikey"),
+			firstQueryValueByNormalizedKey(u, "token"),
+			authTokenFromURL(u),
+			authTokenFromHeaders(headers),
+		)
+		if inboundDeviceID != "" && token != "" {
+			outboundID := m.ResolveOutboundDeviceID(sec, snap, inboundDeviceID, token)
+			m.RememberTokenDeviceID(token, outboundID)
+		}
 		applyYambyQueryAuthToHeaders(u, headers)
 		setTokenHeaderIfMissing(headers, authTokenFromHeaders(headers))
 		return
 	}
 	if usesHillsAuthFormat(snap) {
-		applyHillsQueryIdentityToURL(u, headers, snap)
+		m.applyHillsQueryIdentityToURL(u, headers, snap, sec)
 		return
 	}
 	setTokenHeaderIfMissing(headers, authTokenFromURL(u))
 	applyProfileIdentityToURL(u, snap)
 }
 
-func (m *Manager) ApplyToResourceURL(u *url.URL, headers http.Header, profile string) {
+func (m *Manager) ApplyToResourceURL(u *url.URL, headers http.Header, profile string, secret ...string) {
 	if u == nil {
 		return
 	}
 	snap := m.Snapshot(profile)
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
 	if usesYambyAuthFormat(snap) {
 		applyYambyQueryAuthToHeaders(u, headers)
 		setTokenHeaderIfMissing(headers, authTokenFromHeaders(headers))
 		return
 	}
 	if usesHillsAuthFormat(snap) {
-		applyHillsResourceIdentityToURL(u, headers, snap)
+		m.applyHillsResourceIdentityToURL(u, headers, snap, sec)
 		return
 	}
 	setTokenHeaderIfMissing(headers, authTokenFromURL(u))
 	applyProfileIdentityToURL(u, snap)
 }
 
-func (m *Manager) ApplyToDirectURL(u *url.URL, headers http.Header, profile string) {
+func (m *Manager) ApplyToDirectURL(u *url.URL, headers http.Header, profile string, secret ...string) {
 	snap := m.Snapshot(profile)
 	setTokenHeaderIfMissing(headers, firstSanitizedToken(
 		firstQueryValueByNormalizedKey(u, "xembytoken"),
 		firstQueryValueByNormalizedKey(u, "xmediabrowsertoken"),
+		firstQueryValueByNormalizedKey(u, "apikey"),
+		firstQueryValueByNormalizedKey(u, "token"),
 		authTokenFromURL(u),
 	))
-	applyProfileIdentityToHeaders(headers, snap)
+	if headers != nil && InboundDeviceIDFromHeaders(headers) == "" {
+		if qDevID := firstSanitizedToken(
+			firstQueryValueByNormalizedKey(u, "xembydeviceid"),
+			firstQueryValueByNormalizedKey(u, "xmediabrowserdeviceid"),
+			firstQueryValueByNormalizedKey(u, "deviceid"),
+		); qDevID != "" {
+			headers.Set("X-Emby-Device-Id", qDevID)
+		}
+	}
+	sec := ""
+	if len(secret) > 0 {
+		sec = secret[0]
+	}
+	m.applyProfileIdentityToHeaders(headers, snap, sec)
 }
 
 func setTokenHeaderIfMissing(headers http.Header, token string) {
@@ -253,15 +432,28 @@ func setTokenHeaderIfMissing(headers http.Header, token string) {
 	headers.Set("X-Emby-Token", sanitizeHeaderValue(token))
 }
 
-func applyHillsQueryIdentityToURL(u *url.URL, headers http.Header, snap Snapshot) {
+func (m *Manager) applyHillsQueryIdentityToURL(u *url.URL, headers http.Header, snap Snapshot, secret string) {
 	q := u.Query()
 	token := hillsTokenForURL(u, headers)
+	inboundDeviceID := InboundDeviceIDFromHeaders(headers)
+	if inboundDeviceID == "" {
+		inboundDeviceID = firstSanitizedToken(
+			firstQueryValueByNormalizedKey(u, "xembydeviceid"),
+			firstQueryValueByNormalizedKey(u, "xmediabrowserdeviceid"),
+			firstQueryValueByNormalizedKey(u, "deviceid"),
+		)
+	}
+	currentSnap := snap
+	if inboundDeviceID != "" || token != "" {
+		outboundDeviceID := m.ResolveOutboundDeviceID(secret, snap, inboundDeviceID, token)
+		currentSnap.DeviceID = outboundDeviceID
+	}
 	removeHillsQueryIdentity(q)
-	q.Set("X-Emby-Authorization", buildHillsAuthorization(snap))
-	q.Set("X-Emby-Client", snap.ClientName)
-	q.Set("X-Emby-Device-Name", snap.DeviceName)
-	q.Set("X-Emby-Device-Id", snap.DeviceID)
-	q.Set("X-Emby-Client-Version", snap.ClientVersion)
+	q.Set("X-Emby-Authorization", buildHillsAuthorization(currentSnap))
+	q.Set("X-Emby-Client", currentSnap.ClientName)
+	q.Set("X-Emby-Device-Name", currentSnap.DeviceName)
+	q.Set("X-Emby-Device-Id", currentSnap.DeviceID)
+	q.Set("X-Emby-Client-Version", currentSnap.ClientVersion)
 	q.Set("X-Emby-Language", hillsLanguageForURL(u))
 	if token != "" {
 		q.Set("X-Emby-Token", token)
@@ -292,14 +484,14 @@ func isUsersRootPath(u *url.URL) bool {
 	return false
 }
 
-func applyHillsResourceIdentityToURL(u *url.URL, headers http.Header, snap Snapshot) {
+func (m *Manager) applyHillsResourceIdentityToURL(u *url.URL, headers http.Header, snap Snapshot, secret string) {
 	token := hillsTokenForURL(u, headers)
 	q := u.Query()
 	if removeHillsQueryIdentity(q) {
 		u.RawQuery = q.Encode()
 	}
 	setTokenHeaderIfMissing(headers, token)
-	applyProfileIdentityToHeaders(headers, snap)
+	m.applyProfileIdentityToHeaders(headers, snap, secret)
 }
 
 func removeHillsQueryIdentity(q url.Values) bool {
@@ -478,7 +670,7 @@ func isYambyQueryIdentityKey(normalizedKey string) bool {
 		return true
 	}
 	switch normalizedKey {
-	case "deviceid", "devicename":
+	case "deviceid", "devicename", "client", "version":
 		return true
 	default:
 		return false
