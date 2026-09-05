@@ -22,3 +22,6 @@ CLAUDE.md
 
 # 本地文档和归档
 /docs/
+
+# OpenCode 本会话黑板，不入库
+PLAN-*.md

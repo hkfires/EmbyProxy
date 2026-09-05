@@ -67,13 +67,31 @@ func TestOutboundHeaderBuildersMapClientIdentityHeaders(t *testing.T) {
 			},
 		},
 	} {
-		t.Run(tt.name+" without identity headers", func(t *testing.T) {
-			assertNoIdentityHeaders(t, tt.build(http.Header{"User-Agent": {"Client/1.0"}}))
+		t.Run(tt.name+" with full impersonation identity headers", func(t *testing.T) {
+			headers := tt.build(http.Header{"User-Agent": {"Client/1.0"}})
+			if got := headers.Get("X-Emby-Client"); got != "Yamby" {
+				t.Fatalf("X-Emby-Client = %q, want Yamby", got)
+			}
+			if got := headers.Get("X-Emby-Client-Version"); got != "2.0.4.6" {
+				t.Fatalf("X-Emby-Client-Version = %q, want 2.0.4.6", got)
+			}
+			if got := headers.Get("X-Emby-Device-Name"); got != "Android" {
+				t.Fatalf("X-Emby-Device-Name = %q, want Android", got)
+			}
+			if got := headers.Get("X-Emby-Device-Id"); got == "" {
+				t.Fatalf("X-Emby-Device-Id is empty")
+			}
+			if got := headers.Get("X-Emby-Authorization"); !strings.Contains(got, "Client=Yamby") || !strings.Contains(got, "DeviceId="+headers.Get("X-Emby-Device-Id")) {
+				t.Fatalf("X-Emby-Authorization = %q, want Yamby identity", got)
+			}
+			if got := headers.Get("User-Agent"); got != "Yamby/2.0.4.6(Android)" {
+				t.Fatalf("User-Agent = %q, want Yamby UA", got)
+			}
 		})
 	}
 
 	for _, raw := range []http.Header{{}, {"User-Agent": {"Client/1.0"}}} {
-		if got := buildDirect(raw).Get("User-Agent"); got != "Yamby/2.0.4.6(Android" {
+		if got := buildDirect(raw).Get("User-Agent"); got != "Yamby/2.0.4.6(Android)" {
 			t.Fatalf("User-Agent = %q, want impersonated user agent", got)
 		}
 	}
@@ -255,11 +273,18 @@ func TestOutboundHeaderBuildersNormalizeHillsHeadersAndKeepOrdinaryHeaders(t *te
 		t.Run(tt.name, func(t *testing.T) {
 			headers := tt.build(raw)
 			snap := ids.Snapshot("hills_windows")
+			wantDeviceID := identity.DeriveDeviceID(node.Secret, "hills_windows", "source-device", identity.GetProfile("hills_windows"))
 			if got := headers.Get("User-Agent"); got != snap.UserAgent {
 				t.Fatalf("User-Agent = %q, want %q", got, snap.UserAgent)
 			}
-			if got := headers.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Hills Windows"`) || !strings.Contains(got, `DeviceId="`+snap.DeviceID+`"`) {
-				t.Fatalf("X-Emby-Authorization = %q, want Hills identity", got)
+			if got := headers.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Hills Windows"`) || !strings.Contains(got, `DeviceId="`+wantDeviceID+`"`) {
+				t.Fatalf("X-Emby-Authorization = %q, want Hills identity with derived device id", got)
+			}
+			if got := headers.Get("X-Emby-Client"); got != "Hills Windows" {
+				t.Fatalf("X-Emby-Client = %q, want Hills Windows", got)
+			}
+			if got := headers.Get("X-Emby-Device-Id"); got != wantDeviceID {
+				t.Fatalf("X-Emby-Device-Id = %q, want derived device id %q", got, wantDeviceID)
 			}
 			if got := headers.Get("X-Emby-Token"); got != "source-token" {
 				t.Fatalf("X-Emby-Token = %q, want source-token", got)
@@ -277,7 +302,7 @@ func TestOutboundHeaderBuildersNormalizeHillsHeadersAndKeepOrdinaryHeaders(t *te
 			}
 			assertHeaderKeysAbsent(t, headers,
 				"Authorization", "X-Authorization",
-				"X-Emby-Client", "X-MediaBrowser-Client",
+				"X-MediaBrowser-Client",
 			)
 		})
 	}
@@ -299,7 +324,6 @@ func TestWebSocketHandshakeAddsHillsIdentityQuery(t *testing.T) {
 	applyIdentityToURL(ids, targetURL, outboundHeaders, node)
 	headers := buildWebSocketHeaders(ids, outboundHeaders, targetURL, node)
 
-	snap := ids.Snapshot("hills_windows")
 	query := targetURL.Query()
 	if got := query.Get("X-Emby-Language"); got != "zh-cn" {
 		t.Fatalf("X-Emby-Language = %q, want zh-cn", got)
@@ -310,7 +334,8 @@ func TestWebSocketHandshakeAddsHillsIdentityQuery(t *testing.T) {
 	if got := query.Get("tag"); got != "v1" {
 		t.Fatalf("tag = %q, want v1", got)
 	}
-	if got := query.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Hills Windows"`) || !strings.Contains(got, `DeviceId="`+snap.DeviceID+`"`) {
+	wantDeviceID := identity.DeriveDeviceID(node.Secret, "hills_windows", "source-device", identity.GetProfile("hills_windows"))
+	if got := query.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Hills Windows"`) || !strings.Contains(got, `DeviceId="`+wantDeviceID+`"`) {
 		t.Fatalf("X-Emby-Authorization = %q, want Hills identity", got)
 	}
 	if query.Has("x_emby_device_id") {
@@ -351,5 +376,180 @@ func assertNoIdentityHeaders(t *testing.T, headers http.Header, except ...string
 		if got := headers.Get(key); got != "" {
 			t.Fatalf("%s = %q, want empty", key, got)
 		}
+	}
+}
+
+func TestUnimpersonatedUserAgentBehavior(t *testing.T) {
+	ids := identity.NewManager(nil)
+	node := storage.Node{Impersonate: false}
+	targetURL, _ := url.Parse("https://upstream.example/emby/Items")
+
+	// 1. 关伪装有 UA：出站保持原 UA，不是 Go-http-client，不是 Profile UA
+	rawWithUA := http.Header{"User-Agent": {"Lenna/1.0"}}
+	h1 := buildCleanProxyHeaders(ids, rawWithUA, targetURL, node, config.ProxyEnv{}, false)
+	if got := h1.Get("User-Agent"); got != "Lenna/1.0" {
+		t.Fatalf("User-Agent = %q, want Lenna/1.0", got)
+	}
+
+	// 2. 关伪装无 UA：保留 key 为 nil，避免 Go 补默认 UA
+	rawNoUA := http.Header{}
+	h2 := buildCleanProxyHeaders(ids, rawNoUA, targetURL, node, config.ProxyEnv{}, false)
+	vals, ok := h2["User-Agent"]
+	if !ok {
+		t.Fatalf("expected User-Agent key to be present to suppress Go-http-client")
+	}
+	if len(vals) != 0 {
+		t.Fatalf("expected User-Agent slice to be nil/empty, got %v", vals)
+	}
+}
+
+func TestUnimpersonatedMissingClientFallback(t *testing.T) {
+	ids := identity.NewManager(nil)
+	node := storage.Node{Impersonate: false}
+
+	// 1. 原有 X-Emby-Client 保留，不被改写
+	u1, _ := url.Parse("https://upstream.example/emby/Items?client=other")
+	h1 := http.Header{
+		"X-Emby-Client": {"OriginalClient"},
+	}
+	out1 := buildCleanProxyHeaders(ids, h1, u1, node, config.ProxyEnv{}, false)
+	if got := out1.Get("X-Emby-Client"); got != "OriginalClient" {
+		t.Fatalf("X-Emby-Client = %q, want OriginalClient", got)
+	}
+	assertNoIdentityHeaders(t, out1, "X-Emby-Client")
+
+	// 2. 无 Client，从 Authorization Client= 补缺
+	u2, _ := url.Parse("https://upstream.example/emby/Items")
+	h2 := http.Header{
+		"X-Emby-Authorization": {`Emby Client="FromAuth", Device="Dev", DeviceId="id", Version="1.0"`},
+	}
+	out2 := buildCleanProxyHeaders(ids, h2, u2, node, config.ProxyEnv{}, false)
+	if got := out2.Get("X-Emby-Client"); got != "FromAuth" {
+		t.Fatalf("X-Emby-Client = %q, want FromAuth", got)
+	}
+
+	// 3. 无 Client，从 query client 补缺
+	u3, _ := url.Parse("https://upstream.example/emby/Items?client=FromQuery")
+	h3 := http.Header{}
+	out3 := buildCleanProxyHeaders(ids, h3, u3, node, config.ProxyEnv{}, false)
+	if got := out3.Get("X-Emby-Client"); got != "FromQuery" {
+		t.Fatalf("X-Emby-Client = %q, want FromQuery", got)
+	}
+
+	// 4. 两者都无，禁止兜底
+	u4, _ := url.Parse("https://upstream.example/emby/Items")
+	h4 := http.Header{}
+	out4 := buildCleanProxyHeaders(ids, h4, u4, node, config.ProxyEnv{}, false)
+	if got := out4.Get("X-Emby-Client"); got != "" {
+		t.Fatalf("X-Emby-Client = %q, want empty (no fallback)", got)
+	}
+}
+
+func TestVidhubImpersonatedIdentityOutbound(t *testing.T) {
+	ids := identity.NewManager(nil)
+	node := storage.Node{
+		Impersonate:        true,
+		ImpersonateProfile: "yamby",
+		Secret:             "test-node-secret",
+	}
+
+	targetURL, _ := url.Parse("https://upstream.example/emby/Items?client=vidhub&version=1.0.0&tag=v1")
+	rawHeaders := http.Header{
+		"User-Agent":       {"Vidhub/1.0.0(iOS)"},
+		"X-Emby-Device-Id": {"vidhub-device-uuid-1"},
+		"X-Emby-Token":     {"vidhub-token-123"},
+	}
+
+	applyIdentityToURL(ids, targetURL, rawHeaders, node)
+
+	// query 中必须删除了 client 和 version，但保留其他 query
+	if targetURL.Query().Has("client") {
+		t.Fatalf("query still has client: %s", targetURL.RawQuery)
+	}
+	if targetURL.Query().Has("version") {
+		t.Fatalf("query still has version: %s", targetURL.RawQuery)
+	}
+	if targetURL.Query().Get("tag") != "v1" {
+		t.Fatalf("tag query = %q, want v1", targetURL.Query().Get("tag"))
+	}
+
+	outbound := buildCleanProxyHeaders(ids, rawHeaders, targetURL, node, config.ProxyEnv{}, false)
+
+	// 验证五元组
+	if got := outbound.Get("X-Emby-Client"); got != "Yamby" {
+		t.Fatalf("X-Emby-Client = %q, want Yamby", got)
+	}
+	if got := outbound.Get("X-Emby-Client-Version"); got != "2.0.4.6" {
+		t.Fatalf("X-Emby-Client-Version = %q, want 2.0.4.6", got)
+	}
+	if got := outbound.Get("X-Emby-Device-Name"); got != "Android" {
+		t.Fatalf("X-Emby-Device-Name = %q, want Android", got)
+	}
+	derivedID := identity.DeriveDeviceID(node.Secret, "yamby", "vidhub-device-uuid-1", identity.GetProfile("yamby"))
+	if got := outbound.Get("X-Emby-Device-Id"); got != derivedID {
+		t.Fatalf("X-Emby-Device-Id = %q, want derived %q", got, derivedID)
+	}
+	// UA 必须带闭合括号
+	if got := outbound.Get("User-Agent"); got != "Yamby/2.0.4.6(Android)" {
+		t.Fatalf("User-Agent = %q, want Yamby/2.0.4.6(Android)", got)
+	}
+	// Authorization
+	wantAuth := "Emby Client=Yamby,Device=Android,DeviceId=" + derivedID + ",Version=2.0.4.6"
+	if got := outbound.Get("X-Emby-Authorization"); got != wantAuth {
+		t.Fatalf("X-Emby-Authorization = %q, want %q", got, wantAuth)
+	}
+	// Token 只出站 X-Emby-Token
+	if got := outbound.Get("X-Emby-Token"); got != "vidhub-token-123" {
+		t.Fatalf("X-Emby-Token = %q, want vidhub-token-123", got)
+	}
+	if strings.Contains(outbound.Get("X-Emby-Authorization"), "vidhub-token-123") {
+		t.Fatalf("Authorization must not contain token")
+	}
+}
+
+func TestImpersonatedDeviceIDDerivationAndTokenAlias(t *testing.T) {
+	ids := identity.NewManager(nil)
+	node := storage.Node{
+		Impersonate:        true,
+		ImpersonateProfile: "yamby",
+		Secret:             "secret-1",
+	}
+
+	targetURL, _ := url.Parse("https://upstream.example/emby/Items")
+
+	// 1. 两个不同入站 DeviceId -> 产生不同出站 ID
+	hA := http.Header{"X-Emby-Device-Id": {"dev-A"}, "X-Emby-Token": {"tok-A"}}
+	outA1 := buildCleanProxyHeaders(ids, hA, targetURL, node, config.ProxyEnv{}, false)
+
+	hB := http.Header{"X-Emby-Device-Id": {"dev-B"}, "X-Emby-Token": {"tok-B"}}
+	outB := buildCleanProxyHeaders(ids, hB, targetURL, node, config.ProxyEnv{}, false)
+
+	if outA1.Get("X-Emby-Device-Id") == outB.Get("X-Emby-Device-Id") {
+		t.Fatalf("different inbound device IDs should yield different outbound IDs: %q", outA1.Get("X-Emby-Device-Id"))
+	}
+
+	// 2. 同一入站 DeviceId 多次请求 -> 同一出站 ID
+	outA2 := buildCleanProxyHeaders(ids, hA, targetURL, node, config.ProxyEnv{}, false)
+	if outA1.Get("X-Emby-Device-Id") != outA2.Get("X-Emby-Device-Id") {
+		t.Fatalf("same inbound device ID must yield identical outbound ID")
+	}
+
+	// 3. 先发带 DeviceId+Token 的 API，后续只带 Token 的播放直链 -> 复用出站 ID
+	directURL, _ := url.Parse("https://upstream.example/emby/Videos/123/stream.mp4?api_key=tok-A")
+	directHeaders := http.Header{}
+	applyIdentityToDirectURL(ids, directURL, directHeaders, node)
+
+	if got := directHeaders.Get("X-Emby-Device-Id"); got != outA1.Get("X-Emby-Device-Id") {
+		t.Fatalf("token alias lookup = %q, want same as API request %q", got, outA1.Get("X-Emby-Device-Id"))
+	}
+
+	// 4. 纯 Token 且未命中映射（冷启动直链）-> 回落到 KV 持久 ID，禁止随机
+	fallbackURL, _ := url.Parse("https://upstream.example/emby/Videos/999/stream.mp4?api_key=unknown-tok")
+	fallbackHeaders := http.Header{}
+	applyIdentityToDirectURL(ids, fallbackURL, fallbackHeaders, node)
+
+	snap := ids.Snapshot("yamby")
+	if got := fallbackHeaders.Get("X-Emby-Device-Id"); got != snap.DeviceID {
+		t.Fatalf("fallback device ID = %q, want profile snapshot ID %q", got, snap.DeviceID)
 	}
 }

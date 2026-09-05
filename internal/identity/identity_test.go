@@ -157,7 +157,8 @@ func TestApplyToHeadersMovesAuthorizationToken(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			manager := NewManager(nil)
 			snap := manager.Snapshot(DefaultProfile)
-			wantAuth := "Emby Client=" + snap.ClientName + ",Device=" + snap.DeviceName + ",DeviceId=" + snap.DeviceID + ",Version=" + snap.ClientVersion
+			wantDeviceID := DeriveDeviceID("", DefaultProfile, "source-device-id", GetProfile(DefaultProfile))
+			wantAuth := "Emby Client=" + snap.ClientName + ",Device=" + snap.DeviceName + ",DeviceId=" + wantDeviceID + ",Version=" + snap.ClientVersion
 
 			manager.ApplyToHeaders(tt.headers, DefaultProfile)
 
@@ -206,13 +207,25 @@ func TestApplyToHeadersRewritesEmbyAuthorization(t *testing.T) {
 
 	manager.ApplyToHeaders(headers, "yamby")
 
+	wantDeviceID := DeriveDeviceID("", "yamby", "original-device", GetProfile("yamby"))
+	if got := headers.Get("X-Emby-Client"); got != "Yamby" {
+		t.Fatalf("X-Emby-Client = %q, want Yamby", got)
+	}
+	if got := headers.Get("X-Emby-Client-Version"); got != "2.0.4.6" {
+		t.Fatalf("X-Emby-Client-Version = %q, want 2.0.4.6", got)
+	}
+	if got := headers.Get("X-Emby-Device-Name"); got != "Android" {
+		t.Fatalf("X-Emby-Device-Name = %q, want Android", got)
+	}
+	if got := headers.Get("X-Emby-Device-Id"); got != wantDeviceID {
+		t.Fatalf("X-Emby-Device-Id = %q, want derived %q", got, wantDeviceID)
+	}
 	value := headers.Get("X-Emby-Authorization")
-	if !strings.Contains(value, `Client=Yamby`) || !strings.Contains(value, `Device=Android`) {
+	if !strings.Contains(value, `Client=Yamby`) || !strings.Contains(value, `Device=Android`) || !strings.Contains(value, `DeviceId=`+wantDeviceID) {
 		t.Fatalf("X-Emby-Authorization was not rewritten to yamby identity: %s", value)
 	}
 	for _, key := range []string{
 		"Authorization", "X-Authorization", "X-Application", "X-MediaBrowser-Authorization", "X-MediaBrowser-Token",
-		"X-Emby-Client", "X-Emby-Client-Version", "X-Emby-Device-Id", "X-Emby-Device-Name",
 		"X-MediaBrowser-Client", "X-MediaBrowser-Client-Version", "X-MediaBrowser-Device-Id", "X-MediaBrowser-Device-Name",
 	} {
 		if got := headers.Get(key); got != "" {
@@ -254,6 +267,11 @@ func TestApplyToHeadersPromotesMediaBrowserToken(t *testing.T) {
 
 func TestApplyToHeadersNormalizesUnderscoreHeaderAliases(t *testing.T) {
 	manager := NewManager(nil)
+	yambySnap := manager.Snapshot("yamby")
+	yambySnap.DeviceID = DeriveDeviceID("", "yamby", "source-device-id", Profiles["yamby"])
+	hillsSnap := manager.Snapshot("hills_windows")
+	hillsSnap.DeviceID = DeriveDeviceID("", "hills_windows", "source-device-id", Profiles["hills_windows"])
+
 	tests := []struct {
 		name    string
 		profile string
@@ -262,12 +280,12 @@ func TestApplyToHeadersNormalizesUnderscoreHeaderAliases(t *testing.T) {
 		{
 			name:    "yamby",
 			profile: "yamby",
-			want:    buildYambyAuthorization(testSourceEmbyTokenAuth, manager.Snapshot("yamby")),
+			want:    buildYambyAuthorization(testSourceEmbyTokenAuth, yambySnap),
 		},
 		{
 			name:    "hills",
 			profile: "hills_windows",
-			want:    buildHillsAuthorization(manager.Snapshot("hills_windows")),
+			want:    buildHillsAuthorization(hillsSnap),
 		},
 	}
 
@@ -295,13 +313,29 @@ func TestApplyToHeadersNormalizesUnderscoreHeaderAliases(t *testing.T) {
 	}
 }
 
-func TestApplyToHeadersDoesNotAddMissingEmbyHeaders(t *testing.T) {
+func TestApplyToHeadersAddsMissingProfileHeaders(t *testing.T) {
 	manager := NewManager(nil)
 	headers := http.Header{}
 
 	manager.ApplyToHeaders(headers, "yamby")
 
-	for _, key := range []string{"Authorization", "X-Application", "X-Emby-Authorization", "X-Emby-Client", "X-Emby-Client-Version", "X-Emby-Device-Name", "X-Emby-Device-Id"} {
+	snap := manager.Snapshot("yamby")
+	if got := headers.Get("X-Emby-Client"); got != "Yamby" {
+		t.Fatalf("X-Emby-Client = %q, want Yamby", got)
+	}
+	if got := headers.Get("X-Emby-Client-Version"); got != "2.0.4.6" {
+		t.Fatalf("X-Emby-Client-Version = %q, want 2.0.4.6", got)
+	}
+	if got := headers.Get("X-Emby-Device-Name"); got != "Android" {
+		t.Fatalf("X-Emby-Device-Name = %q, want Android", got)
+	}
+	if got := headers.Get("X-Emby-Device-Id"); got != snap.DeviceID {
+		t.Fatalf("X-Emby-Device-Id = %q, want fallback device ID %q", got, snap.DeviceID)
+	}
+	if got := headers.Get("X-Emby-Authorization"); !strings.Contains(got, "Client=Yamby") {
+		t.Fatalf("X-Emby-Authorization = %q, want Yamby authorization", got)
+	}
+	for _, key := range []string{"Authorization", "X-Application", "X-MediaBrowser-Authorization"} {
 		if got := headers.Get(key); got != "" {
 			t.Fatalf("%s = %q, want empty", key, got)
 		}
@@ -323,7 +357,22 @@ func TestApplyToHeadersNormalizesHillsIdentityHeaders(t *testing.T) {
 
 	manager.ApplyToHeaders(headers, "hills_windows")
 
+	wantDeviceID := DeriveDeviceID("", "hills_windows", "original-device", Profiles["hills_windows"])
 	snap := manager.Snapshot("hills_windows")
+	snap.DeviceID = wantDeviceID
+
+	if got := headers.Get("X-Emby-Client"); got != "Hills Windows" {
+		t.Fatalf("X-Emby-Client = %q, want Hills Windows", got)
+	}
+	if got := headers.Get("X-Emby-Client-Version"); got != "1.3.1" {
+		t.Fatalf("X-Emby-Client-Version = %q, want 1.3.1", got)
+	}
+	if got := headers.Get("X-Emby-Device-Name"); got != snap.DeviceName {
+		t.Fatalf("X-Emby-Device-Name = %q, want %q", got, snap.DeviceName)
+	}
+	if got := headers.Get("X-Emby-Device-Id"); got != wantDeviceID {
+		t.Fatalf("X-Emby-Device-Id = %q, want %q", got, wantDeviceID)
+	}
 	if got := headers.Get("X-Emby-Authorization"); got != buildHillsAuthorization(snap) {
 		t.Fatalf("X-Emby-Authorization = %q, want Hills auth", got)
 	}
@@ -331,8 +380,7 @@ func TestApplyToHeadersNormalizesHillsIdentityHeaders(t *testing.T) {
 		t.Fatalf("X-Emby-Token = %q, want source-token", got)
 	}
 	for _, key := range []string{
-		"Authorization", "X-Authorization", "X-Application",
-		"X-Emby-Client", "X-Emby-Client-Version", "X-Emby-Device-Name", "X-Emby-Device-Id", "X-Emby-Language",
+		"Authorization", "X-Authorization", "X-Application", "X-Emby-Language",
 		"X-MediaBrowser-Authorization", "X-MediaBrowser-Client", "X-MediaBrowser-Client-Version", "X-MediaBrowser-Device-Name", "X-MediaBrowser-Device-Id", "X-MediaBrowser-Token",
 	} {
 		if got := headers.Get(key); got != "" {
@@ -579,9 +627,10 @@ func TestApplyToURLKeepsHillsQueryIdentityBehavior(t *testing.T) {
 		}
 	}
 	query := u.Query()
+	wantDeviceID := DeriveDeviceID("", "hills_windows", "synthetic-source-device-id", Profiles["hills_windows"])
 	for key, want := range map[string]string{
 		"X-Emby-Device-Name": hillsWindows.DeviceName,
-		"X-Emby-Device-Id":   hillsWindows.DeviceID,
+		"X-Emby-Device-Id":   wantDeviceID,
 		"X-Emby-Language":    "en-us",
 		"X-Emby-Token":       "source-token",
 	} {
@@ -624,6 +673,8 @@ func TestApplyToURLNormalizesHillsQueryIdentity(t *testing.T) {
 	manager.ApplyToURL(u, headers, "hills_android")
 
 	snap := manager.Snapshot("hills_android")
+	wantDeviceID := DeriveDeviceID("", "hills_android", "source-device", Profiles["hills_android"])
+	snap.DeviceID = wantDeviceID
 	query := u.Query()
 	for key, want := range map[string]string{
 		"X-Emby-Authorization":  buildHillsAuthorization(snap),
@@ -834,5 +885,65 @@ func TestProfileDeviceIdentityDefaults(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDeriveDeviceIDFormats(t *testing.T) {
+	secret := "test-secret"
+	inboundID := "client-inbound-device-id-12345"
+
+	// 1. yamby UUIDv4
+	yambyID := DeriveDeviceID(secret, "yamby", inboundID, Profiles["yamby"])
+	if !isUUID(yambyID) {
+		t.Fatalf("yamby derived ID %q is not a valid UUID", yambyID)
+	}
+	// UUIDv4 校验: version 4, variant 1 (8, 9, a, b)
+	if yambyID[14] != '4' {
+		t.Fatalf("yamby derived ID %q version byte is %c, want 4", yambyID, yambyID[14])
+	}
+	varChar := yambyID[19]
+	if varChar != '8' && varChar != '9' && varChar != 'a' && varChar != 'b' {
+		t.Fatalf("yamby derived ID %q variant char is %c, want 8/9/a/b", yambyID, varChar)
+	}
+
+	// 2. hills_android 16 hex
+	hillsAndroidID := DeriveDeviceID(secret, "hills_android", inboundID, Profiles["hills_android"])
+	if !isHexLength(hillsAndroidID, 16) {
+		t.Fatalf("hills_android derived ID %q is not 16 hex", hillsAndroidID)
+	}
+
+	// 3. hills_windows 32 hex
+	hillsWindowsID := DeriveDeviceID(secret, "hills_windows", inboundID, Profiles["hills_windows"])
+	if !isHexLength(hillsWindowsID, 32) {
+		t.Fatalf("hills_windows derived ID %q is not 32 hex", hillsWindowsID)
+	}
+
+	// 4. 纯函数确定性
+	yambyID2 := DeriveDeviceID(secret, "yamby", inboundID, Profiles["yamby"])
+	if yambyID != yambyID2 {
+		t.Fatalf("same inputs must yield identical derived ID: %q != %q", yambyID, yambyID2)
+	}
+
+	// 5. 不同入站 DeviceId
+	yambyOther := DeriveDeviceID(secret, "yamby", "different-device", Profiles["yamby"])
+	if yambyID == yambyOther {
+		t.Fatalf("different inbound IDs must yield different derived IDs")
+	}
+
+	// 6. 出站不是入站原文
+	if yambyID == inboundID || hillsAndroidID == inboundID || hillsWindowsID == inboundID {
+		t.Fatalf("outbound ID must not equal inbound ID raw value")
+	}
+}
+
+func TestTokenAliasMapping(t *testing.T) {
+	manager := NewManager(nil)
+	if got := manager.LookupTokenDeviceID("non-existent"); got != "" {
+		t.Fatalf("lookup non-existent token = %q, want empty", got)
+	}
+
+	manager.RememberTokenDeviceID("token-123", "derived-device-id-123")
+	if got := manager.LookupTokenDeviceID("token-123"); got != "derived-device-id-123" {
+		t.Fatalf("lookup token-123 = %q, want derived-device-id-123", got)
 	}
 }
