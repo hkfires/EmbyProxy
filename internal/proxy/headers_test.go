@@ -73,7 +73,7 @@ func TestOutboundHeaderBuildersMapClientIdentityHeaders(t *testing.T) {
 	}
 
 	for _, raw := range []http.Header{{}, {"User-Agent": {"Client/1.0"}}} {
-		if got := buildDirect(raw).Get("User-Agent"); got != "Yamby/2.0.4.6(Android" {
+		if got := buildDirect(raw).Get("User-Agent"); got != "Yamby/2.1.0.11(Android" {
 			t.Fatalf("User-Agent = %q, want impersonated user agent", got)
 		}
 	}
