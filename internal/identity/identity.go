@@ -153,7 +153,7 @@ func applyProfileIdentityToHeaders(headers http.Header, snap Snapshot) {
 	auth := firstEmbyAuthorizationHeader(headers)
 	stripImpersonationHeaders(headers)
 	switch {
-	case usesHillsAuthFormat(snap):
+	case usesHillsAuthFormat(snap) && auth != "":
 		headers.Set("X-Emby-Authorization", buildHillsAuthorization(snap))
 	case auth != "":
 		headers.Set("X-Emby-Authorization", buildYambyAuthorization(auth, snap))
@@ -206,7 +206,7 @@ func (m *Manager) ApplyToURL(u *url.URL, headers http.Header, profile string) {
 	}
 	snap := m.Snapshot(profile)
 	if usesYambyAuthFormat(snap) {
-		applyYambyQueryAuthToHeaders(u, headers)
+		applyYambyQueryAuthToHeaders(u, headers, false)
 		setTokenHeaderIfMissing(headers, authTokenFromHeaders(headers))
 		return
 	}
@@ -224,7 +224,7 @@ func (m *Manager) ApplyToResourceURL(u *url.URL, headers http.Header, profile st
 	}
 	snap := m.Snapshot(profile)
 	if usesYambyAuthFormat(snap) {
-		applyYambyQueryAuthToHeaders(u, headers)
+		applyYambyQueryAuthToHeaders(u, headers, true)
 		setTokenHeaderIfMissing(headers, authTokenFromHeaders(headers))
 		return
 	}
@@ -254,7 +254,11 @@ func setTokenHeaderIfMissing(headers http.Header, token string) {
 }
 
 func applyHillsQueryIdentityToURL(u *url.URL, headers http.Header, snap Snapshot) {
+	if !hillsAuthorizationPresent(u, headers) {
+		return
+	}
 	q := u.Query()
+	hasQueryAuthorization := hillsQueryAuthorizationPresent(u)
 	token := hillsTokenForURL(u, headers)
 	removeHillsQueryIdentity(q)
 	q.Set("X-Emby-Authorization", buildHillsAuthorization(snap))
@@ -268,6 +272,9 @@ func applyHillsQueryIdentityToURL(u *url.URL, headers http.Header, snap Snapshot
 		if headers != nil {
 			headers.Set("X-Emby-Token", sanitizeHeaderValue(token))
 		}
+	}
+	if hasQueryAuthorization && headers != nil && firstEmbyAuthorizationHeader(headers) == "" {
+		headers.Set("X-Emby-Authorization", buildHillsAuthorization(snap))
 	}
 	u.RawQuery = q.Encode()
 }
@@ -293,12 +300,14 @@ func isUsersRootPath(u *url.URL) bool {
 }
 
 func applyHillsResourceIdentityToURL(u *url.URL, headers http.Header, snap Snapshot) {
-	token := hillsTokenForURL(u, headers)
+	hasQueryAuthorization := hillsQueryAuthorizationPresent(u)
 	q := u.Query()
-	if removeHillsQueryIdentity(q) {
+	if removeHillsResourceQueryIdentity(q) {
 		u.RawQuery = q.Encode()
 	}
-	setTokenHeaderIfMissing(headers, token)
+	if hasQueryAuthorization && headers != nil && firstEmbyAuthorizationHeader(headers) == "" {
+		headers.Set("X-Emby-Authorization", buildHillsAuthorization(snap))
+	}
 	applyProfileIdentityToHeaders(headers, snap)
 }
 
@@ -311,6 +320,43 @@ func removeHillsQueryIdentity(q url.Values) bool {
 		}
 	}
 	return changed
+}
+
+func removeHillsResourceQueryIdentity(q url.Values) bool {
+	changed := false
+	for key, values := range q {
+		normalizedKey := normalizeHeaderKey(key)
+		if normalizedKey == "xembytoken" || normalizedKey == "xmediabrowsertoken" {
+			continue
+		}
+		if isHillsQueryIdentityParam(normalizedKey, values) {
+			q.Del(key)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func hillsAuthorizationPresent(u *url.URL, headers http.Header) bool {
+	return firstEmbyAuthorizationHeader(headers) != "" || hillsQueryAuthorizationPresent(u)
+}
+
+func hillsQueryAuthorizationPresent(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	for key, values := range u.Query() {
+		normalizedKey := normalizeHeaderKey(key)
+		switch normalizedKey {
+		case "authorization", "xauthorization", "xembyauthorization", "xmediabrowserauthorization":
+			for _, value := range values {
+				if isEmbyAuthorization(value) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func hillsTokenForURL(u *url.URL, headers http.Header) string {
@@ -434,7 +480,7 @@ var yambyQueryAuthHeaders = map[string]string{
 	"xmediabrowsertoken":         "X-MediaBrowser-Token",
 }
 
-func applyYambyQueryAuthToHeaders(u *url.URL, headers http.Header) {
+func applyYambyQueryAuthToHeaders(u *url.URL, headers http.Header, preserveBareIdentity bool) {
 	q := u.Query()
 	changed := false
 
@@ -463,6 +509,9 @@ func applyYambyQueryAuthToHeaders(u *url.URL, headers http.Header) {
 			continue
 		}
 		if isYambyQueryIdentityKey(normalizedKey) {
+			if preserveBareIdentity && (normalizedKey == "deviceid" || normalizedKey == "devicename") {
+				continue
+			}
 			q.Del(key)
 			changed = true
 		}

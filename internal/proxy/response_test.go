@@ -1289,7 +1289,7 @@ func TestHandleMediaProxyAddsHillsIdentityToMediaAndImageTargets(t *testing.T) {
 		{
 			name:       "media stream",
 			requestURI: "https://proxy.example/node/emby/Videos/1/stream.mp4?tag=v1",
-			targetURL:  "https://upstream.example/emby/Videos/1/stream.mp4?tag=v1&X_Emby_Device_Id=source-device",
+			targetURL:  "https://upstream.example/emby/Videos/1/stream.mp4?tag=v1&DeviceId=source-device&X-Emby-Token=header-token",
 			routePath:  "/emby/Videos/1/stream.mp4",
 			isPlayback: true,
 			clientName: upstreamPoolPlaybackStream,
@@ -1356,7 +1356,10 @@ func TestHandleMediaProxyAddsHillsIdentityToMediaAndImageTargets(t *testing.T) {
 				t.Fatalf("unsupported client %q", tt.clientName)
 			}
 			req := httptest.NewRequest(http.MethodGet, tt.requestURI, nil).WithContext(ctx)
-			req.Header.Set("X-Emby-Token", "header-token")
+			if tt.wantQueryIdentity {
+				req.Header.Set("X-Emby-Authorization", `Emby Client="Source", Device="SOURCE", DeviceId="source-device", Version="0.0.0-test"`)
+				req.Header.Set("X-Emby-Token", "header-token")
+			}
 			targetURL, err := url.Parse(tt.targetURL)
 			if err != nil {
 				t.Fatal(err)
@@ -1373,11 +1376,24 @@ func TestHandleMediaProxyAddsHillsIdentityToMediaAndImageTargets(t *testing.T) {
 			if upstreamReq == nil {
 				t.Fatal("upstream request was not sent")
 			}
-			assertHillsOutboundHeaderIdentityApplied(t, ids, upstreamReq, "hills_android", "header-token")
 			if tt.wantQueryIdentity {
+				assertHillsOutboundHeaderIdentityApplied(t, ids, upstreamReq, "hills_android", "header-token")
 				assertHillsOutboundQueryIdentityApplied(t, ids, upstreamReq, "hills_android", "header-token")
+			} else if tt.name == "media stream" {
+				if got := upstreamReq.Header.Get("X-Emby-Authorization"); got != "" {
+					t.Fatalf("X-Emby-Authorization = %q, want absent for Hills stream", got)
+				}
+				if got := upstreamReq.Header.Get("X-Emby-Token"); got != "" {
+					t.Fatalf("X-Emby-Token = %q, want token in query", got)
+				}
+				if got := upstreamReq.URL.Query().Get("X-Emby-Token"); got != "header-token" {
+					t.Fatalf("X-Emby-Token query = %q, want header-token", got)
+				}
 			} else {
 				assertHillsIdentityQueryAbsent(t, upstreamReq)
+				if got := upstreamReq.Header.Get("X-Emby-Authorization"); got != "" {
+					t.Fatalf("X-Emby-Authorization = %q, want absent for Hills image", got)
+				}
 			}
 			if got := upstreamReq.URL.Query().Get("tag"); got != "v1" {
 				t.Fatalf("tag = %q, want v1", got)
@@ -2559,6 +2575,7 @@ func TestHandleNodeAddsHillsIdentityToProxyTarget(t *testing.T) {
 	})}
 	node := storage.Node{Name: "node", Secret: "secret", Target: "https://upstream.example", Impersonate: true, ImpersonateProfile: "hills_windows"}
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.example/node/secret/emby/System/Ping?tag=v1&x_emby_device_id=source-device&X-Emby-Language=en-us", nil)
+	req.Header.Set("X-Emby-Authorization", `Emby Client="Source", Device="SOURCE", DeviceId="source-device", Version="0.0.0-test"`)
 	req.Header.Set("X-Emby-Token", "header-token")
 
 	res, err := h.handleNode(ctx, req, node, parsedRoute{Name: "node", Secret: "secret", Path: "/emby/System/Ping"}, nil, config.ProxyEnv{})
@@ -2614,6 +2631,7 @@ func TestHandleSTRMAddsHillsIdentityToSourceRequest(t *testing.T) {
 		})},
 	}
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.example/node/movie.strm", nil)
+	req.Header.Set("X-Emby-Authorization", `Emby Client="Source", Device="SOURCE", DeviceId="source-device", Version="0.0.0-test"`)
 	req.Header.Set("X-Emby-Token", "header-token")
 	sourceURL, err := url.Parse("https://upstream.example/movie.strm?X_MediaBrowser_Client=Original&DeviceId=source-device&tag=v1")
 	if err != nil {
@@ -3006,8 +3024,8 @@ func TestHandleDirectPreservesSignedQueryAndAddsHillsHeaderIdentity(t *testing.T
 	if got := upstreamReq.Header.Get("User-Agent"); got != snap.UserAgent {
 		t.Fatalf("User-Agent = %q, want %q", got, snap.UserAgent)
 	}
-	if got := upstreamReq.Header.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="`+snap.ClientName+`"`) {
-		t.Fatalf("X-Emby-Authorization header = %q, want Hills identity", got)
+	if got := upstreamReq.Header.Get("X-Emby-Authorization"); got != "" {
+		t.Fatalf("X-Emby-Authorization header = %q, want absent for direct resource", got)
 	}
 	if got := upstreamReq.Header.Get("X-Emby-Token"); got != "header-token" {
 		t.Fatalf("X-Emby-Token header = %q, want header-token", got)

@@ -599,7 +599,10 @@ func TestApplyToURLKeepsHillsQueryIdentityBehavior(t *testing.T) {
 
 func TestApplyToURLKeepsHillsDefaultLanguageOutsideUsersRoot(t *testing.T) {
 	manager := NewManager(nil)
-	headers := http.Header{"X-Emby-Token": {"header-token"}}
+	headers := http.Header{
+		"X-Emby-Token":         {"header-token"},
+		"X-Emby-Authorization": {testSourceEmbyAuth},
+	}
 	u, err := url.Parse("https://example.test/emby/Users/1/Items?X-Emby-Language=en-us&tag=v1")
 	if err != nil {
 		t.Fatal(err)
@@ -618,7 +621,10 @@ func TestApplyToURLKeepsHillsDefaultLanguageOutsideUsersRoot(t *testing.T) {
 
 func TestApplyToURLNormalizesHillsQueryIdentity(t *testing.T) {
 	manager := NewManager(nil)
-	headers := http.Header{"X-Emby-Token": {"header-token"}}
+	headers := http.Header{
+		"X-Emby-Token":         {"header-token"},
+		"X-Emby-Authorization": {testSourceEmbyAuth},
+	}
 	u := parseIdentityURL(t, "x_emby_client=Original&X_EMBY_DEVICE_ID=source-device&X-MediaBrowser-Client=MediaClient&X_MediaBrowser_DeviceId=media-device&DeviceId=bare-device&DeviceName=bare-name&Version=0.0.0-test&Language=en-us&token=signed-token&client=signed-client&authorization=Bearer+direct-token&X-Emby-Token=query-token&X-Emby-Token=second-query-token&quality=90&tag=v1")
 
 	manager.ApplyToURL(u, headers, "hills_android")
@@ -664,9 +670,8 @@ func TestApplyToResourceURLKeepsResourceQueryHeaderIdentity(t *testing.T) {
 
 	manager.ApplyToResourceURL(u, headers, "hills_windows")
 
-	snap := manager.Snapshot("hills_windows")
 	query := u.Query()
-	for _, key := range []string{"x_emby_client", "X_EMBY_DEVICE_ID", "X-MediaBrowser-Token", "X-Emby-Authorization", "X-Emby-Client", "X-Emby-Token"} {
+	for _, key := range []string{"x_emby_client", "X_EMBY_DEVICE_ID", "X-Emby-Authorization", "X-Emby-Client"} {
 		if query.Has(key) {
 			t.Fatalf("%s query was not removed: %s", key, u.RawQuery)
 		}
@@ -685,11 +690,14 @@ func TestApplyToResourceURLKeepsResourceQueryHeaderIdentity(t *testing.T) {
 	if got := headers.Get("User-Agent"); got != "" {
 		t.Fatalf("User-Agent = %q, want unchanged", got)
 	}
-	if got := headers.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="`+snap.ClientName+`"`) {
-		t.Fatalf("X-Emby-Authorization = %q, want Hills header identity", got)
+	if got := headers.Get("X-Emby-Authorization"); got != "" {
+		t.Fatalf("X-Emby-Authorization = %q, want no identity for resource request", got)
 	}
-	if got := headers.Get("X-Emby-Token"); got != "media-query-token" {
-		t.Fatalf("X-Emby-Token = %q, want media-query-token", got)
+	if got := headers.Get("X-Emby-Token"); got != "" {
+		t.Fatalf("X-Emby-Token = %q, want token to remain in query", got)
+	}
+	if got := query.Get("X-MediaBrowser-Token"); got != "media-query-token" {
+		t.Fatalf("X-MediaBrowser-Token = %q, want media-query-token", got)
 	}
 }
 
@@ -770,10 +778,68 @@ func TestApplyToURLHillsTokenPriority(t *testing.T) {
 			if got := u.Query().Get("X-Emby-Token"); got != tt.want {
 				t.Fatalf("X-Emby-Token query = %q, want %q", got, tt.want)
 			}
-			if strings.Contains(strings.ToLower(u.Query().Get("X-Emby-Authorization")), "token=") {
+			if tt.want != "" && strings.Contains(strings.ToLower(u.Query().Get("X-Emby-Authorization")), "token=") {
 				t.Fatalf("X-Emby-Authorization still contains token: %q", u.Query().Get("X-Emby-Authorization"))
 			}
 		})
+	}
+}
+
+func TestApplyToURLDoesNotAddHillsIdentityWithoutAuthorization(t *testing.T) {
+	manager := NewManager(nil)
+	headers := http.Header{}
+	u := parseIdentityURL(t, "tag=v1")
+
+	manager.ApplyToURL(u, headers, "hills_windows")
+	manager.ApplyToHeaders(headers, "hills_windows")
+
+	if got := u.RawQuery; got != "tag=v1" {
+		t.Fatalf("RawQuery = %q, want tag=v1", got)
+	}
+	for _, key := range []string{"X-Emby-Authorization", "X-Emby-Token"} {
+		if got := headers.Get(key); got != "" {
+			t.Fatalf("%s = %q, want absent", key, got)
+		}
+	}
+}
+
+func TestApplyToResourceURLKeepsYambyStreamDeviceID(t *testing.T) {
+	manager := NewManager(nil)
+	headers := http.Header{}
+	u := parseIdentityURL(t, "DeviceId=source-device&MediaSourceId=source-media&PlaySessionId=session&api_key=token")
+
+	manager.ApplyToResourceURL(u, headers, "yamby")
+
+	query := u.Query()
+	if got := query.Get("DeviceId"); got != "source-device" {
+		t.Fatalf("DeviceId = %q, want source-device", got)
+	}
+	if got := query.Get("api_key"); got != "token" {
+		t.Fatalf("api_key = %q, want token", got)
+	}
+	if got := headers.Get("X-Emby-Authorization"); got != "" {
+		t.Fatalf("X-Emby-Authorization = %q, want absent", got)
+	}
+}
+
+func TestApplyToResourceURLKeepsHillsStreamTokenInQuery(t *testing.T) {
+	manager := NewManager(nil)
+	headers := http.Header{}
+	u := parseIdentityURL(t, "DeviceId=source-device&X-Emby-Token=token&MediaSourceId=source-media")
+
+	manager.ApplyToResourceURL(u, headers, "hills_android")
+
+	query := u.Query()
+	if got := query.Get("DeviceId"); got != "source-device" {
+		t.Fatalf("DeviceId = %q, want source-device", got)
+	}
+	if got := query.Get("X-Emby-Token"); got != "token" {
+		t.Fatalf("X-Emby-Token = %q, want token", got)
+	}
+	for _, key := range []string{"X-Emby-Authorization", "X-Emby-Token"} {
+		if got := headers.Get(key); got != "" {
+			t.Fatalf("%s = %q, want absent", key, got)
+		}
 	}
 }
 
