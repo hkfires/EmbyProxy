@@ -21,6 +21,7 @@ import (
 	"embyproxy/internal/auth"
 	"embyproxy/internal/capture"
 	"embyproxy/internal/config"
+	"embyproxy/internal/identity"
 	"embyproxy/internal/storage"
 )
 
@@ -154,6 +155,18 @@ func (h *Handler) handleMediaProxy(ctx context.Context, r *http.Request, node st
 			q := targetURL.Query()
 			q.Set("api_key", apiKey)
 			targetURL.RawQuery = q.Encode()
+		}
+	}
+	// Image, stream, and smartstrm clients do not send Emby identity headers.
+	// Converge after header rewriting and api_key restoration so neither step can put them back.
+	if node.Impersonate && h.ids != nil {
+		switch {
+		case isImageAPI:
+			h.ids.NormalizeImpersonatedResource(targetURL, hClean, node.ImpersonateProfile, identity.ResourceImage)
+		case isStreamingMedia && isSmartStrmPath(targetURL.Path):
+			h.ids.NormalizeImpersonatedResource(targetURL, hClean, node.ImpersonateProfile, identity.ResourceSmartSTRM)
+		case isStreamingMedia:
+			h.ids.NormalizeImpersonatedResource(targetURL, hClean, node.ImpersonateProfile, identity.ResourceStream)
 		}
 	}
 	stage := "media-proxy"

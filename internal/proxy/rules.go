@@ -205,6 +205,10 @@ func isImagePath(path string) bool {
 	return embyItemImagesRE.MatchString(path) || embyImagesRE.MatchString(path)
 }
 
+func isSmartStrmPath(path string) bool {
+	return strings.Contains(normalizedEmbyAPIPath(path), "/smartstrm")
+}
+
 func isAdditionalPartsPath(path string) bool {
 	return additionalPartsPathRE.MatchString(path)
 }

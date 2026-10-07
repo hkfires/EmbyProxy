@@ -1402,6 +1402,140 @@ func TestHandleMediaProxyAddsHillsIdentityToMediaAndImageTargets(t *testing.T) {
 	}
 }
 
+func TestHandleMediaProxyConvergesImpersonatedResourceRequests(t *testing.T) {
+	tests := []struct {
+		name                   string
+		profile                string
+		requestURI             string
+		targetURL              string
+		routePath              string
+		isPlayback             bool
+		isImage                bool
+		clientName             string
+		wantQuery              map[string]string
+		absentKeys             []string
+		wantImpersonatedDevice bool
+	}{
+		{
+			name:                   "hills stream",
+			profile:                "hills_android",
+			requestURI:             "https://proxy.example/node/emby/Videos/1/stream.mp4?api_key=restored-token",
+			targetURL:              "https://upstream.example/emby/Videos/1/stream.mp4?DeviceId=playback-device&MediaSourceId=media",
+			routePath:              "/emby/Videos/1/stream.mp4",
+			isPlayback:             true,
+			clientName:             upstreamPoolPlaybackStream,
+			wantQuery:              map[string]string{"MediaSourceId": "media", "X-Emby-Token": "header-token"},
+			absentKeys:             []string{"api_key", "X-Emby-Authorization", "X-Emby-Client"},
+			wantImpersonatedDevice: true,
+		},
+		{
+			name:                   "yamby stream",
+			profile:                "yamby",
+			requestURI:             "https://proxy.example/node/emby/videos/1/original.mp4",
+			targetURL:              "https://upstream.example/emby/videos/1/original.mp4?DeviceId=playback-device&X-Emby-Token=query-token",
+			routePath:              "/emby/videos/1/original.mp4",
+			isPlayback:             true,
+			clientName:             upstreamPoolPlaybackStream,
+			wantQuery:              map[string]string{"api_key": "header-token"},
+			absentKeys:             []string{"X-Emby-Token"},
+			wantImpersonatedDevice: true,
+		},
+		{
+			name:       "hills user image",
+			profile:    "hills_windows",
+			requestURI: "https://proxy.example/node/emby/Users/53e8ba118ff03b60ce84ef46ecc869f3/Images/Primary?tag=v1",
+			targetURL:  "https://upstream.example/emby/Users/53e8ba118ff03b60ce84ef46ecc869f3/Images/Primary?tag=v1",
+			routePath:  "/emby/Users/53e8ba118ff03b60ce84ef46ecc869f3/Images/Primary",
+			isImage:    true,
+			clientName: upstreamPoolImageFollow,
+			wantQuery:  map[string]string{"tag": "v1", "api_key": "header-token"},
+			absentKeys: []string{"X-Emby-Token", "X-Emby-Authorization"},
+		},
+		{
+			name:       "smartstrm",
+			profile:    "hills_windows",
+			requestURI: "https://proxy.example/node/emby/smartstrm?item_id=529209",
+			targetURL:  "https://upstream.example/emby/smartstrm?item_id=529209&DeviceId=playback-device",
+			routePath:  "/emby/smartstrm",
+			isPlayback: true,
+			clientName: upstreamPoolPlaybackStream,
+			wantQuery:  map[string]string{"item_id": "529209", "api_key": "header-token"},
+			absentKeys: []string{"DeviceId", "X-Emby-Token"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := WithAccessLogFields(context.Background())
+			var upstreamReq *http.Request
+			successClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				upstreamReq = req.Clone(req.Context())
+				upstreamReq.Header = cloneHeader(req.Header)
+				return bytesResponse(http.StatusOK, []byte("ok"), http.Header{"Content-Type": []string{"application/octet-stream"}}), nil
+			})}
+			h := &Handler{
+				ids:                  identity.NewManager(nil),
+				log:                  logging.New("silent", false),
+				playbackActionClient: failRoundTripClient(t, "playback action client should not handle "+tt.name),
+				playbackStreamClient: failRoundTripClient(t, "playback stream client should not handle "+tt.name),
+				imageFollowClient:    failRoundTripClient(t, "image follow client should not handle "+tt.name),
+			}
+			switch tt.clientName {
+			case upstreamPoolPlaybackStream:
+				h.playbackStreamClient = successClient
+			case upstreamPoolImageFollow:
+				h.imageFollowClient = successClient
+			default:
+				t.Fatalf("unsupported client %q", tt.clientName)
+			}
+			req := httptest.NewRequest(http.MethodGet, tt.requestURI, nil).WithContext(ctx)
+			req.Header.Set("X-Emby-Authorization", `Emby Client="Source", Device="SOURCE", DeviceId="source-device", Version="0.0.0-test"`)
+			req.Header.Set("X-Emby-Token", "header-token")
+			req.Header.Set("User-Agent", "Original/1.0")
+			targetURL, err := url.Parse(tt.targetURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := storage.Node{Name: "node", Target: "https://upstream.example", Impersonate: true, ImpersonateProfile: tt.profile}
+
+			res, err := h.handleMediaProxy(ctx, req, node, parsedRoute{Name: "node", Path: tt.routePath}, targetURL, nil, config.ProxyEnv{}, tt.isPlayback, tt.isImage, false, "", "127.0.0.1")
+			if err != nil {
+				t.Fatalf("handleMediaProxy() error = %v", err)
+			}
+			_, _ = io.Copy(io.Discard, res.Body)
+			_ = res.Body.Close()
+			if upstreamReq == nil {
+				t.Fatal("upstream request was not sent")
+			}
+			query := upstreamReq.URL.Query()
+			for key, want := range tt.wantQuery {
+				if got := query.Get(key); got != want {
+					t.Fatalf("%s = %q, want %q; raw query: %s", key, got, want, upstreamReq.URL.RawQuery)
+				}
+			}
+			for _, key := range tt.absentKeys {
+				if query.Has(key) {
+					t.Fatalf("%s query = %q, want absent; raw query: %s", key, query.Get(key), upstreamReq.URL.RawQuery)
+				}
+			}
+			if tt.wantImpersonatedDevice {
+				wantID := h.ids.Snapshot(tt.profile).DeviceID
+				if got := query.Get("DeviceId"); got != wantID {
+					t.Fatalf("DeviceId = %q, want impersonated %q; raw query: %s", got, wantID, upstreamReq.URL.RawQuery)
+				}
+			}
+			for _, key := range []string{"X-Emby-Authorization", "X-Emby-Token", "X-Emby-Client"} {
+				if got := upstreamReq.Header.Get(key); got != "" {
+					t.Fatalf("%s header = %q, want absent", key, got)
+				}
+			}
+			if got := upstreamReq.Header.Get("User-Agent"); got != identity.GetProfile(tt.profile).UserAgent {
+				t.Fatalf("User-Agent = %q, want impersonated user agent", got)
+			}
+		})
+	}
+}
+
 func TestHandleNodeRoutesDirectExternalPlaybackActionToPlaybackActionClient(t *testing.T) {
 	ctx := WithAccessLogFields(context.Background())
 	actionCalls := 0

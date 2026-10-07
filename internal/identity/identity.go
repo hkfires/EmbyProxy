@@ -255,6 +255,10 @@ func setTokenHeaderIfMissing(headers http.Header, token string) {
 
 func applyHillsQueryIdentityToURL(u *url.URL, headers http.Header, snap Snapshot) {
 	if !hillsAuthorizationPresent(u, headers) {
+		q := u.Query()
+		if deleteNormalizedQueryKey(q, "deviceid") {
+			u.RawQuery = q.Encode()
+		}
 		return
 	}
 	q := u.Query()
@@ -292,11 +296,142 @@ func isUsersRootPath(u *url.URL) bool {
 	}
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 	for i, part := range parts {
-		if strings.EqualFold(part, "users") {
-			return i+2 == len(parts) && strings.TrimSpace(parts[i+1]) != ""
+		if !strings.EqualFold(part, "users") {
+			continue
+		}
+		if i+2 != len(parts) {
+			return false
+		}
+		segment := strings.TrimSpace(parts[i+1])
+		return segment != "" && !isUsersCollectionAction(segment)
+	}
+	return false
+}
+
+func isUsersCollectionAction(segment string) bool {
+	switch strings.ToLower(strings.TrimSpace(segment)) {
+	case "authenticate", "authenticatebyname", "public", "new", "forgotpassword", "query":
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	ResourceImage     = "image"
+	ResourceStream    = "stream"
+	ResourceSmartSTRM = "smartstrm"
+)
+
+// NormalizeImpersonatedResource converges image, playback stream, and smartstrm
+// requests to the shapes used by the impersonated clients. It runs after the
+// generic identity rewrite, which preserves authorization that those requests do not send.
+func (m *Manager) NormalizeImpersonatedResource(u *url.URL, headers http.Header, profile string, kind string) {
+	if u == nil {
+		return
+	}
+	switch kind {
+	case ResourceImage, ResourceStream, ResourceSmartSTRM:
+	default:
+		return
+	}
+	snap := Snapshot{Profile: NormalizeProfile(profile)}
+	if m != nil {
+		snap = m.Snapshot(profile)
+	}
+	token := impersonatedResourceToken(u, headers)
+	stripImpersonatedResourceHeaders(headers)
+	q := u.Query()
+	removeImpersonatedResourceQueryIdentity(q)
+	switch kind {
+	case ResourceImage:
+		deleteNormalizedQueryKey(q, "deviceid")
+		if usesHillsAuthFormat(snap) && isUserImagePath(u) && token != "" {
+			q.Set("api_key", token)
+		}
+	case ResourceStream:
+		deleteNormalizedQueryKey(q, "deviceid")
+		if snap.DeviceID != "" {
+			q.Set("DeviceId", snap.DeviceID)
+		}
+		if usesHillsAuthFormat(snap) {
+			deleteNormalizedQueryKey(q, "apikey")
+			if token != "" {
+				q.Set("X-Emby-Token", token)
+			}
+		} else if token != "" {
+			q.Set("api_key", token)
+		}
+	case ResourceSmartSTRM:
+		deleteNormalizedQueryKey(q, "deviceid")
+		deleteNormalizedQueryKey(q, "devicename")
+		if token != "" {
+			q.Set("api_key", token)
+		}
+	}
+	u.RawQuery = q.Encode()
+}
+
+func isUserImagePath(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i := 0; i+2 < len(parts); i++ {
+		if strings.EqualFold(parts[i], "users") &&
+			strings.TrimSpace(parts[i+1]) != "" &&
+			!isUsersCollectionAction(parts[i+1]) &&
+			strings.EqualFold(parts[i+2], "images") {
+			return true
 		}
 	}
 	return false
+}
+
+func impersonatedResourceToken(u *url.URL, headers http.Header) string {
+	return firstSanitizedToken(
+		firstHeaderValue(headers, "X-Emby-Token"),
+		firstHeaderValue(headers, "X-MediaBrowser-Token"),
+		firstHeaderValueByNormalizedKey(headers, "xembytoken"),
+		firstHeaderValueByNormalizedKey(headers, "xmediabrowsertoken"),
+		firstQueryValueByNormalizedKey(u, "xembytoken"),
+		firstQueryValueByNormalizedKey(u, "xmediabrowsertoken"),
+		firstQueryValueByNormalizedKey(u, "apikey"),
+		authTokenFromURL(u),
+		authTokenFromHeaders(headers),
+	)
+}
+
+func stripImpersonatedResourceHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	stripImpersonationHeaders(headers)
+	for key := range cloneHeader(headers) {
+		switch normalizeHeaderKey(key) {
+		case "xembytoken", "xmediabrowsertoken":
+			deleteHeaderKey(headers, key)
+		}
+	}
+}
+
+func removeImpersonatedResourceQueryIdentity(q url.Values) {
+	for key, values := range q {
+		if isHillsQueryIdentityParam(normalizeHeaderKey(key), values) {
+			q.Del(key)
+		}
+	}
+}
+
+func deleteNormalizedQueryKey(q url.Values, normalizedKey string) bool {
+	changed := false
+	for key := range q {
+		if normalizeHeaderKey(key) == normalizedKey {
+			q.Del(key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func applyHillsResourceIdentityToURL(u *url.URL, headers http.Header, snap Snapshot) {
@@ -429,6 +564,8 @@ func isHillsQueryIdentityParam(normalizedKey string, values []string) bool {
 		return true
 	}
 	switch normalizedKey {
+	case "deviceid":
+		return true
 	case "authorization", "xauthorization":
 		for _, value := range values {
 			if isEmbyAuthorization(value) {
@@ -509,7 +646,7 @@ func applyYambyQueryAuthToHeaders(u *url.URL, headers http.Header, preserveBareI
 			continue
 		}
 		if isYambyQueryIdentityKey(normalizedKey) {
-			if preserveBareIdentity && (normalizedKey == "deviceid" || normalizedKey == "devicename") {
+			if preserveBareIdentity && normalizedKey == "devicename" {
 				continue
 			}
 			q.Del(key)
