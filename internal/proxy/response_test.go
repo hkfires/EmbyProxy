@@ -2547,8 +2547,8 @@ func TestServeHTTPTracksConcurrentPlaybackSessionsWithoutQuerySessionID(t *testi
 	send("/emby/Sessions/Playing/Progress", "play-1", 300_000)
 	send("/emby/Sessions/Playing/Progress", "play-2", 400_000)
 
-	if actionCalls != 3 {
-		t.Fatalf("playback action upstream calls = %d, want 3 with the second Progress throttled", actionCalls)
+	if actionCalls != 4 {
+		t.Fatalf("playback action upstream calls = %d, want 4 with both Progress requests forwarded", actionCalls)
 	}
 	var states int
 	var positions int64
@@ -2560,6 +2560,46 @@ func TestServeHTTPTracksConcurrentPlaybackSessionsWithoutQuerySessionID(t *testi
 	}
 	if states != 2 || positions != 700_000 {
 		t.Fatalf("playback states = %d positions = %d; want 2 and 700000", states, positions)
+	}
+}
+
+func TestServeHTTPForwardsProgressForDifferentNodesSharingDevice(t *testing.T) {
+	store := newProxyTestStore(t)
+	for _, name := range []string{"okemby", "sntp"} {
+		if err := store.SaveNode(context.Background(), "admin", storage.Node{
+			Name:   name,
+			Secret: "secret",
+			Target: "https://upstream.example",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h := New(config.Config{Defaults: config.Defaults{ProgressThrottleMS: 5000}}, store, nil, logging.New("silent", false))
+	actionCalls := 0
+	h.playbackActionClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		actionCalls++
+		return textResponse(http.StatusNoContent, "", nil), nil
+	})}
+	send := func(node, playSessionID string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"ItemId":"item","PlaySessionId":"%s","PositionTicks":1,"IsPaused":false}`, playSessionID)
+		req := httptest.NewRequest(http.MethodPost, "https://proxy.example/"+node+"/secret/emby/Sessions/Playing/Progress", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Emby-Device-Id", "shared-device")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("%s status = %d, want %d; body = %s", node, rr.Code, http.StatusNoContent, rr.Body.String())
+		}
+	}
+
+	send("okemby", "31d0532c87e24f7c99ecca63d2df11e2")
+	send("sntp", "80ff55c4a2d647f49a2601796f6fd8ac")
+	send("okemby", "31d0532c87e24f7c99ecca63d2df11e2")
+
+	if actionCalls != 2 {
+		t.Fatalf("playback action upstream calls = %d, want 2 with only the repeated okemby progress throttled", actionCalls)
 	}
 }
 

@@ -136,6 +136,43 @@ func (h *Handler) tryAuthAPI(ctx context.Context, r *http.Request, node storage.
 	return nil
 }
 
+func progressThrottleKey(nodeName, clientIP, deviceID, sessionID string, requestURL *url.URL, body []byte) string {
+	nodeName = strings.ToLower(strings.TrimSpace(nodeName))
+	if nodeName == "" {
+		nodeName = "unknown"
+	}
+	if playSessionID := playSessionIDFromProgress(requestURL, body); playSessionID != "" {
+		return nodeName + "|play|" + playSessionID
+	}
+	return strings.Join([]string{nodeName, strings.TrimSpace(clientIP), strings.TrimSpace(deviceID), strings.TrimSpace(sessionID)}, "|")
+}
+
+func playSessionIDFromProgress(requestURL *url.URL, body []byte) string {
+	if requestURL != nil {
+		for _, name := range []string{"PlaySessionId", "playSessionId", "play_session_id"} {
+			if value := strings.TrimSpace(requestURL.Query().Get(name)); value != "" {
+				return value
+			}
+		}
+	}
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 || body[0] != '{' {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	for _, name := range []string{"PlaySessionId", "playSessionId", "play_session_id"} {
+		if value, ok := payload[name].(string); ok {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
 func (h *Handler) handleMediaProxy(ctx context.Context, r *http.Request, node storage.Node, parsed parsedRoute, targetURL *url.URL, body []byte, env config.ProxyEnv, isPlaybackAPI, isImageAPI, isAdditionalPartsAPI bool, reqOrigin, clientIP string) (*http.Response, error) {
 	playbackOccurredAt := playbackRequestOccurredAt(r.Context())
 	if r.Method == http.MethodPost && isSessionsPlayingLifecyclePath(parsed.Path) {
@@ -181,7 +218,7 @@ func (h *Handler) handleMediaProxy(ctx context.Context, r *http.Request, node st
 		if sessionID == "" {
 			sessionID = targetURL.Query().Get("sessionId")
 		}
-		key := clientIP + "|" + deviceID + "|" + sessionID
+		key := progressThrottleKey(parsed.Name, clientIP, deviceID, sessionID, targetURL, body)
 		if _, ok := h.progressThrottle.Get(key); ok {
 			capture.SetMeta(r, map[string]any{"mode": "proxy", "node": parsed.Name, "secret": node.Secret, "stage": "progress-throttle", "targetUrl": targetURL.String(), "outboundHeaders": hClean})
 			h.registerPlayback(r, storage.PlaybackInput{Node: node, RequestIP: clientIP, Headers: r.Header, Status: http.StatusNoContent, IsPlayback: true, Mode: "proxy", RequestURL: r.URL.RequestURI(), Method: r.Method, RequestBody: body, OccurredAt: playbackOccurredAt})
