@@ -107,6 +107,7 @@ ADMIN_TOKEN=用于访问面板的管理密钥
 | `ADMIN_2FA_DISABLED` | `false` | 验证器丢失或轮换 `ADMIN_TOKEN` 时临时停用管理员 2FA；修改后需重启，恢复完成后应立即改回 `false` |
 | `PORT` | `8787` | HTTP 服务监听端口，程序默认绑定 `0.0.0.0` |
 | `DB_PATH` | `./data/proxy.db` | SQLite 数据库路径 |
+| `SERVER_NAME` | 空 | 抓包日志文件名中的部署服务器名称；不设置时文件名不加后缀 |
 
 Docker 运行时建议把 `/app/data` 挂载到宿主机目录，避免容器删除后丢失数据库。
 

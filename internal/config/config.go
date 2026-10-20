@@ -21,6 +21,7 @@ type Defaults struct {
 type Config struct {
 	CWD              string
 	DBPath           string
+	ServerName       string
 	Port             int
 	AdminToken       string
 	Admin2FADisabled bool
@@ -46,6 +47,7 @@ func Load() (Config, error) {
 	_ = loadDotEnv(filepath.Join(cwd, ".env"))
 	cfg := Config{
 		CWD:              cwd,
+		ServerName:       strings.TrimSpace(os.Getenv("SERVER_NAME")),
 		DBPath:           envString("DB_PATH", filepath.Join(cwd, "data", "proxy.db")),
 		Port:             envInt("PORT", 8787),
 		AdminToken:       os.Getenv("ADMIN_TOKEN"),

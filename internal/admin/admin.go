@@ -765,6 +765,7 @@ func (h *Handler) clearTrafficCaptureStageRecords(cfg storage.SystemConfig, stag
 
 func (h *Handler) trafficCaptureStatsTarget(cfg storage.SystemConfig) (trafficCaptureStats, string, error) {
 	file, errText := normalizeTrafficCaptureFile(cfg.TrafficCaptureFile, h.defaultSystemConfig().TrafficCaptureFile)
+	file = capture.FileWithServerName(file, h.cfg.ServerName)
 	stats := trafficCaptureStats{Enabled: cfg.TrafficCaptureEnabled, File: file}
 	if errText != "" {
 		return stats, "", errors.New(errText)

@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
@@ -486,7 +488,31 @@ func (r *Recorder) captureFilePath(cfg storage.SystemConfig) string {
 	if file == "" {
 		file = filepath.Join("data", "traffic-captures.jsonl")
 	}
-	return filepath.Join(r.cfg.CWD, file)
+	return filepath.Join(r.cfg.CWD, FileWithServerName(file, r.cfg.ServerName))
+}
+
+// FileWithServerName inserts a filename-safe deployment name before the extension.
+func FileWithServerName(file, serverName string) string {
+	serverName = strings.TrimSpace(serverName)
+	if file == "" || serverName == "" {
+		return file
+	}
+	var name strings.Builder
+	for _, ch := range serverName {
+		if !unicode.IsLetter(ch) && !unicode.IsDigit(ch) && ch != '-' && ch != '_' && ch != '.' {
+			ch = '-'
+		}
+		if name.Len()+utf8.RuneLen(ch) > 64 {
+			break
+		}
+		name.WriteRune(ch)
+	}
+	suffix := strings.Trim(name.String(), ".-_")
+	if suffix == "" {
+		suffix = "unknown-server"
+	}
+	ext := filepath.Ext(file)
+	return strings.TrimSuffix(file, ext) + "-" + suffix + ext
 }
 
 func safeCaptureFile(value string) string {
