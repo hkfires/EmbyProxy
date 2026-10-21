@@ -2027,6 +2027,11 @@ async function saveNode() {
   if (editingNode) data.oldName = editingNode.name;
   const r = await api('save', { node: data });
   if (r.ok) {
+    // An unsaved drag order tracks names; follow a rename so the node keeps its dragged position.
+    if (data.oldName && isNodeOrderDirty()) {
+      const renamed = allNodes.find(n => n.name === data.oldName);
+      if (renamed) renamed.name = r.node.name;
+    }
     closeNodeModal();
     toast('已保存', 'ok');
     await loadNodes();
@@ -2063,8 +2068,11 @@ async function batchTagSelected() {
   const tag = prompt('输入标签名（留空清除）:');
   if (tag === null) return;
   const r = await api('batchTag', { names: [...selectedNodes], tag });
-  if (r.ok) { toast('标签更新', 'ok'); await loadNodes(); }
-  else toast('失败: ' + r.error, 'err');
+  if (r._stale) return;
+  if (r.ok) toast('标签更新', 'ok');
+  else toast('设置标签失败: ' + (r.error || '未知错误'), 'err');
+  // Nodes before a failed write are already updated, so reload either way.
+  await loadNodes();
 }
 
 async function checkNodeStatus(name) {
@@ -3677,7 +3685,10 @@ async function doSaveOrder() {
   const key = nodeOrderKey(allNodes);
   const r = await api('saveOrder', { order: allNodes.map(n => n.name) });
   if (!r.ok) {
-    if (!r._stale) toast('保存排序失败: ' + (r.error || '未知错误'), 'err');
+    if (r._stale) return;
+    toast('保存排序失败: ' + (r.error || '未知错误'), 'err');
+    // Ranks before the failed write are already stored; reload them while keeping the order pending.
+    await loadNodes();
     return;
   }
   // Drags made while saving stay pending; the reload refreshes ranks that node edits send back.

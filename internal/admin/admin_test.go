@@ -764,6 +764,54 @@ func TestTGTestValidatesSubmittedConfig(t *testing.T) {
 	}
 }
 
+func TestNodeBatchWritesReportStorageErrors(t *testing.T) {
+	tests := []struct {
+		action string
+		body   map[string]any
+		check  func(storage.Node) bool
+	}{
+		{action: "saveOrder", body: map[string]any{"order": []any{"b", "gone", "a"}}, check: func(n storage.Node) bool {
+			return n.Rank != nil && *n.Rank == map[string]int{"b": 1, "a": 3}[n.Name]
+		}},
+		{action: "batchTag", body: map[string]any{"names": []any{"a", "gone", "b"}, "tag": "hk"}, check: func(n storage.Node) bool {
+			return n.Tag == "hk"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.action, func(t *testing.T) {
+			ctx := context.Background()
+			handler, closeStore := newConfigTestHandler(t)
+			defer closeStore()
+			for _, name := range []string{"a", "b"} {
+				if err := handler.store.SaveNode(ctx, "admin", storage.Node{Name: name, Target: "https://emby.example.com"}); err != nil {
+					t.Fatalf("SaveNode() error = %v", err)
+				}
+			}
+
+			// Missing nodes are skipped.
+			res, status := handler.dispatch(ctx, "admin", tt.action, tt.body)
+			if status != http.StatusOK || res["ok"] != true {
+				t.Fatalf("dispatch(%s) = %+v (status %d), want ok", tt.action, res, status)
+			}
+			nodes, err := handler.store.ListNodes(ctx, "admin")
+			if err != nil {
+				t.Fatalf("ListNodes() error = %v", err)
+			}
+			for _, node := range nodes {
+				if !tt.check(node) {
+					t.Fatalf("dispatch(%s) did not update node %+v", tt.action, node)
+				}
+			}
+
+			closeStore()
+			res, status = handler.dispatch(ctx, "admin", tt.action, tt.body)
+			if status != http.StatusInternalServerError || res["ok"] == true || res["error"] == "" {
+				t.Fatalf("dispatch(%s) on a closed store = %+v (status %d), want a storage error", tt.action, res, status)
+			}
+		})
+	}
+}
+
 func newConfigTestHandler(t *testing.T) (*Handler, func()) {
 	t.Helper()
 	store, err := storage.New(filepath.Join(t.TempDir(), "proxy.db"))

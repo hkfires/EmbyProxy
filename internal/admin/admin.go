@@ -520,24 +520,35 @@ func (h *Handler) dispatch(ctx context.Context, uid, action string, body map[str
 		if len(order) == 0 {
 			order = arrayStrings(body["names"])
 		}
+		// Nodes deleted since the list was loaded are skipped; storage errors abort the save.
 		for i, name := range order {
-			nm := validators.NormalizeName(name)
-			node, _ := h.store.GetNode(ctx, uid, nm)
-			if node != nil {
-				rank := i + 1
-				node.Rank = &rank
-				_ = h.store.SaveNode(ctx, uid, *node)
+			node, err := h.store.GetNode(ctx, uid, validators.NormalizeName(name))
+			if err != nil {
+				return fail(err.Error()), http.StatusInternalServerError
+			}
+			if node == nil {
+				continue
+			}
+			rank := i + 1
+			node.Rank = &rank
+			if err := h.store.SaveNode(ctx, uid, *node); err != nil {
+				return fail(err.Error()), http.StatusInternalServerError
 			}
 		}
 		return ok(), http.StatusOK
 	case "batchTag":
 		tag := validators.ValidateTag(body["tag"])
 		for _, name := range arrayStrings(body["names"]) {
-			nm := validators.NormalizeName(name)
-			node, _ := h.store.GetNode(ctx, uid, nm)
-			if node != nil {
-				node.Tag = tag
-				_ = h.store.SaveNode(ctx, uid, *node)
+			node, err := h.store.GetNode(ctx, uid, validators.NormalizeName(name))
+			if err != nil {
+				return fail(err.Error()), http.StatusInternalServerError
+			}
+			if node == nil {
+				continue
+			}
+			node.Tag = tag
+			if err := h.store.SaveNode(ctx, uid, *node); err != nil {
+				return fail(err.Error()), http.StatusInternalServerError
 			}
 		}
 		return ok(), http.StatusOK

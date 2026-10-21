@@ -129,9 +129,56 @@ test('a failed save keeps the order pending', async () => {
   await page.run('loadNodes()');
   page.run("moveNodeBeforeOrAfter('b', 'a', false); filterNodes();");
   await page.run('doSaveOrder()');
+  assert.equal(page.calls.at(-1)[0], 'list', 'ranks written before the failure are reloaded');
+  assert.equal(page.order(), 'b,a');
   assert.equal(page.dirty(), true);
   assert.deepEqual(page.toasts.at(-1), ['保存排序失败: 写入失败', 'err']);
 });
+
+test('renaming a node keeps its place in an unsaved order', async () => {
+  let serverNames = ['a', 'b', 'c', 'd'];
+  const page = createNodePage([], {
+    list: () => ({ ok: true, nodes: serverNames.map(name => ({ name, fav: false })) }),
+    // The server keeps the stored rank, so the renamed node stays in its saved position.
+    save: ({ node }) => {
+      serverNames = serverNames.map(name => name === node.oldName ? node.name : name);
+      return { ok: true, node: { name: node.name } };
+    },
+    saveOrder: ({ order }) => {
+      serverNames = [...order];
+      return { ok: true };
+    },
+  });
+  await page.run('loadNodes()');
+  page.run("moveNodeBeforeOrAfter('d', 'a', false); filterNodes();");
+  page.run("editingNode = allNodes.find(n => n.name === 'b');");
+  page.el('f-name').value = 'b2';
+  await page.run('saveNode()');
+  assert.equal(page.order(), 'd,a,b2,c');
+  assert.equal(page.dirty(), true);
+
+  // Without a pending order the list simply follows the server.
+  await page.run('doSaveOrder()');
+  page.run("editingNode = allNodes.find(n => n.name === 'a');");
+  page.el('f-name').value = 'a2';
+  await page.run('saveNode()');
+  assert.equal(page.order(), 'd,a2,b2,c');
+  assert.equal(page.dirty(), false);
+});
+
+for (const { result, toast } of [
+  { result: { ok: true }, toast: ['标签更新', 'ok'] },
+  { result: { ok: false, error: 'database is closed' }, toast: ['设置标签失败: database is closed', 'err'] },
+]) {
+  test(`batch tag reloads nodes after ${result.ok ? 'success' : 'failure'}`, async () => {
+    const page = createNodePage(['a', 'b'], { batchTag: () => result });
+    page.context.prompt = () => 'hk';
+    page.run("selectedNodes.add('a'); selectedNodes.add('b');");
+    await page.run('batchTagSelected()');
+    assert.equal(page.calls.at(-1)[0], 'list', 'nodes written before a failure are reloaded');
+    assert.deepEqual(page.toasts.at(-1), toast);
+  });
+}
 
 test('logging out drops the pending order', async () => {
   const page = createNodePage(['a', 'b']);
