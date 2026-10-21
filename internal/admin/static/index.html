@@ -106,6 +106,10 @@ main{min-width:0;min-height:0}
 .btn-danger{background:var(--red-wash);border-color:rgba(168,59,50,.20);color:var(--red)}
 .btn-danger:hover{background:#fff;border-color:var(--red);color:var(--red)}
 .btn-sm{min-height:34px;border-radius:12px;padding:0 11px;font-size:12px}
+.btn.is-dirty{background:var(--amber-wash);border-color:var(--amber);color:var(--amber)}
+.btn.is-dirty:hover{background:var(--amber);border-color:var(--amber);color:#fff}
+.dirty-mark{min-height:20px;border-radius:999px;padding:0 7px;background:var(--amber);color:#fff;font-size:11px;display:inline-flex;align-items:center}
+.btn.is-dirty:hover .dirty-mark{background:#fff;color:var(--amber)}
 .main-column{display:grid;gap:14px;min-width:0}
 .signal-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
 .signal{min-height:94px;border-radius:24px;background:var(--paper);border:1px solid rgba(255,253,248,.88);padding:16px;box-shadow:0 12px 34px rgba(58,48,32,.055);display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
@@ -539,7 +543,7 @@ tr:last-child td{border-bottom:0}
                 <button class="btn" onclick="openImportModal()">导入</button>
                 <button class="btn" onclick="doExport()" title="未选择时导出全部，已选择时导出选中节点">导出</button>
                 <button class="btn" onclick="openSyncModal()" title="把本机节点推送到其他 EmbyProxy 实例">同步</button>
-                <button class="btn" onclick="doSaveOrder()" title="拖动节点后保存当前排序">保存排序</button>
+                <button class="btn" id="saveOrderBtn" onclick="doSaveOrder()" title="拖动节点后保存当前排序">保存排序</button>
               </div>
             </div>
 
@@ -763,6 +767,7 @@ tr:last-child td{border-bottom:0}
       <label for="importJson">JSON 内容</label>
       <textarea id="importJson" class="code-textarea" placeholder='[{"name":"my-emby","target":"https://emby.example.com","secret":"","tag":""}]'></textarea>
     </div>
+    <div class="sync-results" id="importResults"></div>
     <div class="form-actions">
       <button class="btn" onclick="closeImportModal()">取消</button>
       <button class="primary-action" onclick="doImport()">执行导入</button>
@@ -1213,6 +1218,8 @@ let TWO_FACTOR_ACTION = 'setup';
 let TWO_FACTOR_SETUP_ID = '';
 let twoFactorFlowGeneration = 0;
 let allNodes = [];
+// Server-side node order (names joined by newlines) used to detect unsaved drag reordering.
+let savedNodeOrder = '';
 let editingNode = null;
 let selectedNodes = new Set();
 let draggingNode = '';
@@ -1286,6 +1293,12 @@ const EYE_ICONS = {
 };
 
 window.onload = () => restoreSession();
+window.onbeforeunload = event => {
+  if (!isNodeOrderDirty()) return undefined;
+  event.preventDefault();
+  event.returnValue = '';
+  return '';
+};
 
 async function authFetch(path, options = {}) {
   try {
@@ -1418,6 +1431,8 @@ function showLogin(message = '') {
 function resetProtectedUI() {
   document.querySelectorAll('.sheet-layer').forEach(layer => { layer.style.display = 'none'; });
   editingNode = null;
+  allNodes = [];
+  savedNodeOrder = '';
   twoFactorFlowGeneration++;
   TWO_FACTOR_SETUP_ID = '';
   clearNodeForm();
@@ -1432,7 +1447,7 @@ function resetProtectedUI() {
   syncTargets = [];
   syncUnchecked = new Set();
   resetSyncTargetForm();
-  ['syncTargetList', 'syncResults'].forEach(id => {
+  ['syncTargetList', 'syncResults', 'importResults'].forEach(id => {
     const element = document.getElementById(id);
     if (element) element.innerHTML = '';
   });
@@ -1596,10 +1611,41 @@ async function loadNodes() {
   const r = await api('list');
   if (!r.ok) { toast('加载节点失败: ' + r.error, 'err'); return; }
   setAppVersion(r.build);
-  allNodes = r.nodes || [];
+  const nodes = r.nodes || [];
+  // Reloads triggered by other node actions must not discard an unsaved drag order.
+  const pendingOrder = isNodeOrderDirty() ? allNodes.map(n => n.name) : null;
+  savedNodeOrder = nodeOrderKey(nodes);
+  allNodes = pendingOrder ? applyNodeOrder(nodes, pendingOrder) : nodes;
   syncNodeState();
   renderTagFilter();
   filterNodes();
+}
+
+function nodeOrderKey(nodes) {
+  return nodes.map(n => n.name).join('\n');
+}
+
+function isNodeOrderDirty() {
+  return nodeOrderKey(allNodes) !== savedNodeOrder;
+}
+
+// Favorites stay first to match the server sort; nodes missing from the local order
+// (new or renamed) keep their server position at the end of their group.
+function applyNodeOrder(nodes, order) {
+  const index = new Map(order.map((name, i) => [name, i]));
+  const position = n => index.has(n.name) ? index.get(n.name) : order.length;
+  return nodes.map((node, i) => ({ node, i }))
+    .sort((a, b) => (!!b.node.fav - !!a.node.fav) || (position(a.node) - position(b.node)) || (a.i - b.i))
+    .map(item => item.node);
+}
+
+function renderSaveOrderButton() {
+  const btn = document.getElementById('saveOrderBtn');
+  if (!btn) return;
+  const dirty = isNodeOrderDirty();
+  btn.classList.toggle('is-dirty', dirty);
+  btn.innerHTML = dirty ? '保存排序<span class="dirty-mark">未保存</span>' : '保存排序';
+  btn.title = dirty ? '排序已调整但尚未保存，点击保存' : '拖动节点后保存当前排序';
 }
 
 function setAppVersion(build) {
@@ -1651,6 +1697,7 @@ function filterNodes() {
   renderFocusPanel(nodes);
   renderHeadStatus();
   updateSelBar();
+  renderSaveOrderButton();
 }
 
 function renderHeadStatus() {
@@ -2005,7 +2052,11 @@ async function deleteSelected() {
 
 async function toggleFav(name) {
   const r = await api('toggleFav', { name });
-  if (r.ok) { await loadNodes(); }
+  if (!r.ok) {
+    if (!r._stale) toast('收藏失败: ' + (r.error || '未知错误'), 'err');
+    return;
+  }
+  await loadNodes();
 }
 
 async function batchTagSelected() {
@@ -2055,6 +2106,7 @@ async function checkSelectedStatus() {
 function openImportModal() {
   const file = document.getElementById('importFile');
   if (file) file.value = '';
+  document.getElementById('importResults').innerHTML = '';
   showModal('importModal');
 }
 function closeImportModal() { hideModal('importModal'); }
@@ -2075,21 +2127,55 @@ async function loadImportFile(file) {
 }
 
 async function doImport() {
+  const resultsEl = document.getElementById('importResults');
+  resultsEl.innerHTML = '';
+  const input = document.getElementById('importJson').value;
   let nodes;
-  try { nodes = JSON.parse(document.getElementById('importJson').value); }
-  catch { toast('JSON 格式错误', 'err'); return; }
-  if (!Array.isArray(nodes)) nodes = [nodes];
-  const r = await api('import', { nodes });
-  if (r.ok) {
-    const ok = r.results.filter(x => x.ok).length;
-    const fail = r.results.filter(x => !x.ok);
-    closeImportModal();
-    toast(`导入完成: ${ok} 成功${fail.length?' / ' + fail.length + ' 失败':''}`, ok ? 'ok' : 'err');
-    if (fail.length) console.warn('Import failures:', fail);
-    await loadNodes();
-  } else {
-    toast('导入失败: ' + r.error, 'err');
+  try { nodes = JSON.parse(input); }
+  catch (error) {
+    // Translate malformed user JSON at the UI boundary; never submit a fallback value.
+    if (!(error instanceof SyntaxError)) throw error;
+    toast('JSON 格式错误', 'err');
+    return;
   }
+  if (!Array.isArray(nodes)) nodes = [nodes];
+  // The API treats an empty list as a single node in the request body, so stop here.
+  if (!nodes.length) {
+    toast('没有可导入的节点，未执行导入', 'err');
+    return;
+  }
+  // The API filters non-object entries; reject them here to preserve original input positions.
+  const invalidIndex = nodes.findIndex(node => node === null || typeof node !== 'object' || Array.isArray(node));
+  if (invalidIndex !== -1) {
+    toast(`第 ${invalidIndex + 1} 项必须是节点对象，未执行导入`, 'err');
+    return;
+  }
+  const r = await api('import', { nodes });
+  if (!r.ok) {
+    if (!r._stale) toast('导入失败: ' + (r.error || '未知错误'), 'err');
+    return;
+  }
+  const results = Array.isArray(r.results) ? r.results : [];
+  // Results follow input order, so the position identifies entries without a usable name.
+  const failures = results.map((x, i) => ({ ...x, index: i + 1 })).filter(x => !x.ok);
+  const ok = results.length - failures.length;
+  toast(`导入完成: ${ok} 成功${failures.length ? ' / ' + failures.length + ' 失败' : ''}`, failures.length ? 'err' : 'ok');
+  if (failures.length) resultsEl.innerHTML = renderImportFailures(failures, ok);
+  else closeImportModal();
+  if (ok) await loadNodes();
+}
+
+function renderImportFailures(failures, okCount) {
+  const lines = failures.map(f => {
+    const name = String(f.name ?? '').trim();
+    return `<div class="delete">第 ${f.index} 项${name ? ' ' + esc(name) : ''}：${esc(f.error || '未知错误')}</div>`;
+  }).join('');
+  const hint = (okCount ? `其余 ${okCount} 个节点已导入；` : '') + '修正 JSON 后可再次执行导入';
+  return `<div class="sync-result is-error">
+      <div class="sync-result-head"><b>${failures.length} 个节点未导入</b><span class="chip warn">失败</span></div>
+      <div class="sync-result-meta">${hint}</div>
+      <div class="sync-result-list">${lines}</div>
+    </div>`;
 }
 
 async function doExport() {
@@ -2710,8 +2796,8 @@ function syncTgReportControls() {
 
 
 
-async function saveTg() {
-  const config = {
+function readTgForm() {
+  return {
     enabled: document.getElementById('tg-enabled').checked,
     token: document.getElementById('tg-token').value.trim(),
     chat: document.getElementById('tg-chat').value.trim(),
@@ -2719,15 +2805,20 @@ async function saveTg() {
     reportEnabled: document.getElementById('tg-reportEnabled').checked,
     reportTime: document.getElementById('tg-reportTime').value,
   };
-  const r = await api('tg.set', { config });
+}
+
+async function saveTg() {
+  const r = await api('tg.set', { config: readTgForm() });
   if (r.ok) { closeTgModal(); toast('TG 配置已保存', 'ok'); }
   else toast('保存失败: ' + r.error, 'err');
 }
 
+// Tests the current form values so unsaved edits can be verified before saving.
 async function testTg() {
   toast('发送测试消息…', 'info');
-  const r = await api('tg.test');
-  toast(r.ok ? '测试消息发送成功' : '发送失败: ' + r.error, r.ok ? 'ok' : 'err');
+  const r = await api('tg.test', { config: readTgForm() });
+  if (r._stale) return;
+  toast(r.ok ? '测试消息发送成功' : '发送失败: ' + (r.error || '未知错误'), r.ok ? 'ok' : 'err');
 }
 
 async function loadStats() {
@@ -2911,7 +3002,15 @@ async function loadLogs(showToast = false, page = currentLogPage, options = {}) 
   }
   if (!r.ok) {
     lastLogLoadFailed = true;
-    if (!r._stale) toast('加载日志失败: ' + (loadTimedOut ? '请求超时' : (r.error || '')), 'err');
+    if (r._stale) return false;
+    toast('加载日志失败: ' + (loadTimedOut ? '请求超时' : (r.error || '')), 'err');
+    // Paused realtime resumes only through syncLogRealtime(), so a failed load after leaving
+    // a history page or search must still sync; the stream hydrates and retries on its own.
+    // Loads for a superseded filter skip it because the debounced reload will sync instead.
+    if (currentTab === 'logs' && !options.skipRealtimeSync
+      && requestLevel === currentLogLevelFilter && requestQuery === currentLogQuery) {
+      syncLogRealtime();
+    }
     return false;
   }
   lastLogLoadFailed = false;
@@ -3096,9 +3195,7 @@ function setLogLevelFilter(value) {
 
 function setLogQuery(value) {
   currentLogQuery = String(value || '').trim();
-  if (currentLogQuery && document.getElementById('logAutoRefresh')?.checked) {
-    disableLogAutoRefresh('搜索中', 'paused');
-  }
+  if (currentLogQuery) pauseLogRealtime('搜索中');
   if (logSearchTimer) clearTimeout(logSearchTimer);
   logSearchTimer = setTimeout(() => loadLogs(false, 1), 300);
 }
@@ -3119,7 +3216,7 @@ function loadLatestLogs(showToast = false) {
 
 function loadOlderLogs() {
   if (!currentLogHasOlder || currentLogPage >= currentLogTotalPages) return;
-  disableLogAutoRefresh();
+  pauseLogRealtime('历史页');
   loadLogs(false, currentLogPage + 1);
 }
 
@@ -3136,7 +3233,7 @@ function jumpLogsPage() {
     updateLogPageInput();
     return;
   }
-  if (page > 1) disableLogAutoRefresh();
+  if (page > 1) pauseLogRealtime('历史页');
   loadLogs(false, page);
 }
 
@@ -3167,18 +3264,13 @@ function setLogAutoRefresh(enabled) {
     if (gapRefreshPending && isLogStreamAllowed()) loadLogs(false, 1);
     return;
   }
-  if (currentLogPage > 1) {
-    disableLogAutoRefresh();
-    toast('历史页不启用实时日志，请切回最新页', 'info');
+  if (currentTab !== 'logs') {
+    setLogStreamStatus('待机', 'paused');
     return;
   }
-  if (currentLogQuery) {
-    disableLogAutoRefresh('搜索中', 'paused');
-    toast('搜索时不启用实时日志，请清空搜索后再打开', 'info');
-    return;
-  }
-  if (currentTab === 'logs') startLogStream();
-  else setLogStreamStatus('待机', 'paused');
+  if (currentLogQuery) toast('搜索期间暂停实时日志，清空搜索后自动恢复', 'info');
+  else if (currentLogPage > 1) toast('历史页暂停实时日志，回到最新页后自动恢复', 'info');
+  syncLogRealtime();
 }
 
 function syncLogRealtime() {
@@ -3514,10 +3606,13 @@ function stopLogRealtime(status = '已关闭', mode = '') {
   setLogStreamStatus(status, mode);
 }
 
-function disableLogAutoRefresh(status = '已关闭', mode = '') {
-  const el = document.getElementById('logAutoRefresh');
-  if (el) el.checked = false;
-  stopLogRealtime(status, mode);
+// Pauses updates for history/search views but keeps the checkbox as the user's choice,
+// so syncLogRealtime() resumes them on the latest unfiltered page.
+function pauseLogRealtime(status) {
+  if (!isLogRealtimeEnabled()) return;
+  stopLogStream();
+  stopLogAutoRefresh();
+  setLogStreamStatus(status, 'paused');
 }
 
 function setLogStreamStatus(text, mode = '') {
@@ -3570,13 +3665,25 @@ function testKeepaliveFromButton(btn) {
 async function testKeepalive(name, displayName, renewDays, remindBeforeDays, keepaliveAt) {
   toast('发送保号测试通知…', 'info');
   const r = await api('keepalive.test', { name, displayName, renewDays, remindBeforeDays, keepaliveAt });
-  toast(r.ok ? '保号测试通知已发送' : '发送失败: ' + (r.error || ''), r.ok ? 'ok' : 'err');
+  if (r._stale) return;
+  toast(r.ok ? '保号测试通知已发送' : '发送失败: ' + (r.error || '未知错误'), r.ok ? 'ok' : 'err');
 }
 
 async function doSaveOrder() {
-  const order = allNodes.map(n => n.name);
-  const r = await api('saveOrder', { order });
-  toast(r.ok ? '排序已保存' : '失败: ' + (r.error || ''), r.ok ? 'ok' : 'err');
+  if (!isNodeOrderDirty()) {
+    toast('排序没有改动', 'info');
+    return;
+  }
+  const key = nodeOrderKey(allNodes);
+  const r = await api('saveOrder', { order: allNodes.map(n => n.name) });
+  if (!r.ok) {
+    if (!r._stale) toast('保存排序失败: ' + (r.error || '未知错误'), 'err');
+    return;
+  }
+  // Drags made while saving stay pending; the reload refreshes ranks that node edits send back.
+  savedNodeOrder = key;
+  toast('排序已保存', 'ok');
+  await loadNodes();
 }
 
 function toggleSection(id, btn) {

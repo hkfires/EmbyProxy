@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,11 +29,15 @@ func New(store *storage.Store, log *logging.Logger) *Service {
 	return &Service{store: store, log: log, http: &http.Client{Timeout: 12 * time.Second}}
 }
 
-func (s *Service) Send(ctx context.Context, cfg storage.TGConfig, text string) bool {
+// Send posts text to the configured chat. Returned errors are user-facing and never contain the bot token.
+func (s *Service) Send(ctx context.Context, cfg storage.TGConfig, text string) error {
 	token := strings.TrimSpace(cfg.Token)
 	chat := strings.TrimSpace(cfg.Chat)
-	if token == "" || chat == "" || strings.TrimSpace(text) == "" {
-		return false
+	if token == "" || chat == "" {
+		return errors.New("Bot Token 或 Chat ID 未配置")
+	}
+	if strings.TrimSpace(text) == "" {
+		return errors.New("消息内容为空")
 	}
 	text = withServerRemark(cfg.ServerRemark, text)
 	body, _ := json.Marshal(map[string]any{
@@ -38,18 +45,34 @@ func (s *Service) Send(ctx context.Context, cfg storage.TGConfig, text string) b
 		"text":                     text,
 		"disable_web_page_preview": true,
 	})
-	url := "https://api.telegram.org/bot" + token + "/sendMessage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	endpoint := "https://api.telegram.org/bot" + token + "/sendMessage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return false
+		// The request URL embeds the token, so the parse error is not surfaced.
+		return errors.New("Bot Token 格式无效")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	res, err := s.http.Do(req)
 	if err != nil {
-		return false
+		// *url.Error quotes the request URL, which contains the token; keep only the cause.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return fmt.Errorf("连接 Telegram 失败：%v", err)
 	}
 	defer res.Body.Close()
-	return res.StatusCode >= 200 && res.StatusCode < 300
+	if res.StatusCode >= 200 && res.StatusCode < 300 {
+		return nil
+	}
+	var payload struct {
+		Description string `json:"description"`
+	}
+	_ = json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&payload)
+	if description := strings.TrimSpace(payload.Description); description != "" {
+		return fmt.Errorf("Telegram 返回 %d：%s", res.StatusCode, description)
+	}
+	return fmt.Errorf("Telegram 返回 %d", res.StatusCode)
 }
 
 func withServerRemark(remark, text string) string {
@@ -62,12 +85,8 @@ func withServerRemark(remark, text string) string {
 
 const reportHeaderPrefix = "📊 Emby 播放日报 · "
 
-func (s *Service) BuildReport(ctx context.Context, now int64) (string, error) {
-	cfg, err := s.store.GetTGConfig(ctx)
-	if err != nil {
-		return "", err
-	}
-	reportTime := cfg.ReportTime
+// BuildReport renders the daily report for the window ending at reportTime (HH:mm, local time) on now's day.
+func (s *Service) BuildReport(ctx context.Context, reportTime string, now int64) (string, error) {
 	if reportTime == "" {
 		reportTime = "00:00"
 	}
@@ -134,12 +153,12 @@ func (s *Service) CheckAndSendReport(ctx context.Context) error {
 	if cnt >= 1 {
 		return nil
 	}
-	text, err := s.BuildReport(ctx, now)
+	text, err := s.BuildReport(ctx, cfg.ReportTime, now)
 	if err != nil {
 		return err
 	}
-	if !s.Send(ctx, cfg, text) {
-		s.log.Warn("telegram", "daily report send failed", map[string]any{"event": "dailyReportSendFailed", "day": day})
+	if err := s.Send(ctx, cfg, text); err != nil {
+		s.log.Warn("telegram", "daily report send failed", map[string]any{"event": "dailyReportSendFailed", "day": day, "error": err.Error()})
 		return nil
 	}
 	_ = kv.Put(ctx, cntKey, "1")
@@ -314,8 +333,8 @@ func (s *Service) CheckKeepaliveAndNotify(ctx context.Context) error {
 		if node.KeepaliveChangeOnly && prevDigest == digest {
 			continue
 		}
-		if !s.Send(ctx, cfg, strings.Join(lines, "\n")) {
-			s.log.Warn("telegram", "keepalive send failed", map[string]any{"event": "keepaliveSendFailed", "node": node.Name, "day": day})
+		if err := s.Send(ctx, cfg, strings.Join(lines, "\n")); err != nil {
+			s.log.Warn("telegram", "keepalive send failed", map[string]any{"event": "keepaliveSendFailed", "node": node.Name, "day": day, "error": err.Error()})
 			continue
 		}
 		_ = kv.Put(ctx, lastNotifyKey, strconv.FormatInt(now, 10))

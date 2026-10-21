@@ -723,6 +723,47 @@ func TestTGSetValidatesServerRemark(t *testing.T) {
 	}
 }
 
+func TestTGTestValidatesSubmittedConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   map[string]any
+		stored storage.TGConfig
+		want   string
+	}{
+		{
+			name:   "form values override stored config",
+			body:   map[string]any{"config": map[string]any{"token": "", "chat": "chat"}},
+			stored: storage.TGConfig{Token: "stored-token", Chat: "stored-chat"},
+			want:   "请先填写 Bot Token 和 Chat ID",
+		},
+		{
+			name: "form values are validated like save",
+			body: map[string]any{"config": map[string]any{"token": "token", "chat": "chat", "serverRemark": "a\nb"}},
+			want: "服务器备注不能包含换行",
+		},
+		{
+			name: "falls back to stored config",
+			body: map[string]any{},
+			want: "请先填写 Bot Token 和 Chat ID",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			handler, closeStore := newConfigTestHandler(t)
+			defer closeStore()
+			if err := handler.store.SaveTGConfig(ctx, tt.stored); err != nil {
+				t.Fatalf("SaveTGConfig() error = %v", err)
+			}
+
+			res, status := handler.tgTest(ctx, tt.body)
+			if status != http.StatusOK || res["ok"] == true || res["error"] != tt.want {
+				t.Fatalf("tgTest() = %+v (status %d), want error %q", res, status, tt.want)
+			}
+		})
+	}
+}
+
 func newConfigTestHandler(t *testing.T) (*Handler, func()) {
 	t.Helper()
 	store, err := storage.New(filepath.Join(t.TempDir(), "proxy.db"))
@@ -791,7 +832,7 @@ func TestAdminIndexLogStreamSafeguards(t *testing.T) {
 	signatureBlock := indexFunctionBlock(t, `function computeLogRenderSignature(logs)`, "\n}\n\nfunction renderLogs")
 	assertContainsAll(t, signatureBlock, "`${id}@${log?.time || ''}`")
 
-	stopBlock := indexFunctionBlock(t, `function stopLogRealtime(status = '已关闭', mode = '')`, "\n}\n\nfunction disableLogAutoRefresh")
+	stopBlock := indexFunctionBlock(t, `function stopLogRealtime(status = '已关闭', mode = '')`, "\n}\n\n// Pauses updates for history/search views")
 	if strings.Contains(stopBlock, `abortActiveLogLoad()`) {
 		t.Fatalf("stopLogRealtime() must not abort user-initiated log loads:\n%s", stopBlock)
 	}

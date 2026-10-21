@@ -564,18 +564,7 @@ func (h *Handler) dispatch(ctx context.Context, uid, action string, body map[str
 	case "tg.set":
 		return h.tgSet(ctx, body), http.StatusOK
 	case "tg.test":
-		cfg, err := h.store.GetTGConfig(ctx)
-		if err != nil {
-			return fail(err.Error()), http.StatusInternalServerError
-		}
-		if cfg.Token == "" || cfg.Chat == "" {
-			return fail("TG 未配置"), http.StatusOK
-		}
-		text, err := h.telegram.BuildReport(ctx, time.Now().UnixMilli())
-		if err != nil {
-			return fail(err.Error()), http.StatusInternalServerError
-		}
-		return map[string]any{"ok": h.telegram.Send(ctx, cfg, text)}, http.StatusOK
+		return h.tgTest(ctx, body)
 	case "config.get":
 		cfg, err := h.store.GetSystemConfig(ctx, h.defaultSystemConfig())
 		if err != nil {
@@ -1196,12 +1185,53 @@ func (h *Handler) tgSet(ctx context.Context, body map[string]any) map[string]any
 	if cfgMap == nil {
 		cfgMap = map[string]any{}
 	}
+	cfg, errMsg := parseTGConfig(cfgMap)
+	if errMsg != "" {
+		return fail(errMsg)
+	}
+	if err := h.store.SaveTGConfig(ctx, cfg); err != nil {
+		return fail(err.Error())
+	}
+	return ok()
+}
+
+// tgTest sends a sample report. A submitted config (the unsaved form) takes precedence over the stored one.
+func (h *Handler) tgTest(ctx context.Context, body map[string]any) (map[string]any, int) {
+	var cfg storage.TGConfig
+	if cfgMap := mapFromAny(body["config"]); cfgMap != nil {
+		parsed, errMsg := parseTGConfig(cfgMap)
+		if errMsg != "" {
+			return fail(errMsg), http.StatusOK
+		}
+		cfg = parsed
+	} else {
+		stored, err := h.store.GetTGConfig(ctx)
+		if err != nil {
+			return fail(err.Error()), http.StatusInternalServerError
+		}
+		cfg = stored
+	}
+	if cfg.Token == "" || cfg.Chat == "" {
+		return fail("请先填写 Bot Token 和 Chat ID"), http.StatusOK
+	}
+	text, err := h.telegram.BuildReport(ctx, cfg.ReportTime, time.Now().UnixMilli())
+	if err != nil {
+		return fail(err.Error()), http.StatusInternalServerError
+	}
+	if err := h.telegram.Send(ctx, cfg, text); err != nil {
+		return fail(err.Error()), http.StatusOK
+	}
+	return ok(), http.StatusOK
+}
+
+// parseTGConfig validates Telegram settings from the admin form and returns a user-facing error message.
+func parseTGConfig(cfgMap map[string]any) (storage.TGConfig, string) {
 	reportTime := strings.TrimSpace(asString(cfgMap["reportTime"]))
 	reportTime = strings.NewReplacer("﹕", ":", "∶", ":").Replace(reportTime)
 	if reportTime != "" {
 		m := regexp.MustCompile(`^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.\d+)?)?$`).FindStringSubmatch(reportTime)
 		if len(m) == 0 {
-			return fail("日报推送时间格式不合法（HH:mm）")
+			return storage.TGConfig{}, "日报推送时间格式不合法（HH:mm）"
 		}
 		hh := clamp(intString(m[1]), 0, 23)
 		mm := clamp(intString(m[2]), 0, 59)
@@ -1212,23 +1242,19 @@ func (h *Handler) tgSet(ctx context.Context, body map[string]any) map[string]any
 	}
 	serverRemark := strings.TrimSpace(asString(cfgMap["serverRemark"]))
 	if strings.ContainsAny(serverRemark, "\r\n") {
-		return fail("服务器备注不能包含换行")
+		return storage.TGConfig{}, "服务器备注不能包含换行"
 	}
 	if len([]rune(serverRemark)) > telegramServerRemarkMaxRunes {
-		return fail(fmt.Sprintf("服务器备注不能超过 %d 个字符", telegramServerRemarkMaxRunes))
+		return storage.TGConfig{}, fmt.Sprintf("服务器备注不能超过 %d 个字符", telegramServerRemarkMaxRunes)
 	}
-	cfg := storage.TGConfig{
+	return storage.TGConfig{
 		Enabled:       validators.ToBool(cfgMap["enabled"]),
 		Token:         strings.TrimSpace(asString(cfgMap["token"])),
 		Chat:          strings.TrimSpace(asString(cfgMap["chat"])),
 		ServerRemark:  serverRemark,
 		ReportEnabled: boolValue(cfgMap, "reportEnabled", validators.ToBool(cfgMap["enabled"])),
 		ReportTime:    reportTime,
-	}
-	if err := h.store.SaveTGConfig(ctx, cfg); err != nil {
-		return fail(err.Error())
-	}
-	return ok()
+	}, ""
 }
 
 func (h *Handler) configSet(ctx context.Context, body map[string]any) map[string]any {
@@ -1373,7 +1399,10 @@ func (h *Handler) keepaliveTest(ctx context.Context, body map[string]any) (map[s
 		fmt.Sprintf("提前提醒:%d天", remindBeforeDays),
 		"提醒时间:北京时间 " + keepaliveAt,
 	}, "\n")
-	return map[string]any{"ok": h.telegram.Send(ctx, cfg, text)}, http.StatusOK
+	if err := h.telegram.Send(ctx, cfg, text); err != nil {
+		return fail(err.Error()), http.StatusOK
+	}
+	return ok(), http.StatusOK
 }
 
 func (h *Handler) reset(uid, name string) {

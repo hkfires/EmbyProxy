@@ -83,10 +83,24 @@ function createLogView() {
     stream(id, level) {
       vm.runInContext(`handleLogStreamEntry(${JSON.stringify(log(id, level))}, logStreamToken, logViewEpoch)`, context);
     },
-    resolveSnapshot(ids) {
+    resolveSnapshot(ids, extra = {}) {
       assert.ok(requests.length, 'snapshot request must be pending');
       const newestId = Math.max(0, ...ids);
-      requests.shift()({ ok: true, logs: ids.map(id => log(id)), newestId, streamId: newestId, page: 1, totalEntries: ids.length });
+      requests.shift()({ ok: true, logs: ids.map(id => log(id)), newestId, streamId: newestId, page: 1, totalEntries: ids.length, ...extra });
+    },
+    failSnapshot(error = '服务不可用') {
+      assert.ok(requests.length, 'snapshot request must be pending');
+      requests.shift()({ ok: false, error, _status: 500 });
+    },
+    resolveStale() {
+      assert.ok(requests.length, 'snapshot request must be pending');
+      requests.shift()({ ok: false, error: '', _status: 401, _stale: true });
+    },
+    fireTimer(delay) {
+      const [id, timer] = [...timers].find(([, entry]) => entry.delay === delay) || [];
+      assert.ok(timer, `timer with delay ${delay} must be pending`);
+      timers.delete(id);
+      return timer.callback();
     },
     flushBatch() {
       for (const [id, timer] of [...timers]) {
@@ -176,6 +190,171 @@ test('filtered SSE does not contribute unread entries', async () => {
   view.resolveSnapshot([100, 102]);
   await pending;
   assertLogView(view, [100, 102], 1);
+});
+
+// Replaces the network stream so tests observe when realtime updates would (re)start.
+function stubRealtime(view, enabled) {
+  vm.runInContext(`
+    document.getElementById('logAutoRefresh').checked = ${enabled};
+    realtimeStarts = 0;
+    startLogStream = () => { realtimeStarts++; setLogStreamStatus('已连接', 'stream'); };
+    toast = () => {};
+  `, view.context);
+  return {
+    starts: () => vm.runInContext('realtimeStarts', view.context),
+    status: () => view.elements.get('logStreamStatus').textContent,
+    checked: () => view.elements.get('logAutoRefresh').checked,
+  };
+}
+
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+test('search pauses realtime logs and clearing it resumes them', async () => {
+  const view = createLogView();
+  const realtime = stubRealtime(view, true);
+  vm.runInContext("setLogQuery('abc')", view.context);
+  assert.equal(realtime.checked(), true);
+  assert.equal(realtime.status(), '搜索中');
+  let pending = view.fireTimer(300);
+  view.resolveSnapshot([100]);
+  await pending;
+  assert.equal(realtime.starts(), 0);
+  assert.equal(realtime.status(), '搜索中');
+
+  vm.runInContext("setLogQuery('')", view.context);
+  pending = view.fireTimer(300);
+  view.resolveSnapshot([100]);
+  await pending;
+  assert.equal(realtime.starts(), 1);
+  assert.equal(realtime.checked(), true);
+});
+
+test('history pages pause realtime logs and the latest page resumes them', async () => {
+  const view = createLogView();
+  const realtime = stubRealtime(view, true);
+  vm.runInContext('currentLogHasOlder = true; currentLogTotalPages = 3;', view.context);
+  vm.runInContext('loadOlderLogs()', view.context);
+  assert.equal(realtime.status(), '历史页');
+  view.resolveSnapshot([50], { page: 2, totalEntries: 6000 });
+  await settle();
+  assert.equal(vm.runInContext('currentLogPage', view.context), 2);
+  assert.equal(realtime.checked(), true);
+  assert.equal(realtime.starts(), 0);
+
+  vm.runInContext('loadLatestLogs()', view.context);
+  view.resolveSnapshot([100], { totalEntries: 6000 });
+  await settle();
+  assert.equal(realtime.starts(), 1);
+});
+
+test('realtime logs that the user turned off stay off on the latest page', async () => {
+  const view = createLogView();
+  const realtime = stubRealtime(view, false);
+  vm.runInContext('currentLogHasOlder = true; currentLogTotalPages = 3;', view.context);
+  vm.runInContext('loadOlderLogs()', view.context);
+  view.resolveSnapshot([50], { page: 2, totalEntries: 6000 });
+  await settle();
+  vm.runInContext('loadLatestLogs()', view.context);
+  view.resolveSnapshot([100], { totalEntries: 6000 });
+  await settle();
+  assert.equal(realtime.starts(), 0);
+  assert.equal(realtime.status(), '已关闭');
+
+  // Turning it on from a history page waits for the latest page instead of being rejected.
+  vm.runInContext('loadOlderLogs()', view.context);
+  view.resolveSnapshot([50], { page: 2, totalEntries: 6000 });
+  await settle();
+  vm.runInContext("document.getElementById('logAutoRefresh').checked = true; setLogAutoRefresh(true)", view.context);
+  assert.equal(realtime.status(), '历史页');
+  assert.equal(realtime.starts(), 0);
+  vm.runInContext('loadLatestLogs()', view.context);
+  view.resolveSnapshot([100], { totalEntries: 6000 });
+  await settle();
+  assert.equal(realtime.starts(), 1);
+});
+
+// Opens history page 2 with realtime paused, as the user would before returning to the latest page.
+async function openHistoryPage(view) {
+  vm.runInContext('currentLogHasOlder = true; currentLogTotalPages = 3;', view.context);
+  vm.runInContext('loadOlderLogs()', view.context);
+  view.resolveSnapshot([50], { page: 2, totalEntries: 6000 });
+  await settle();
+}
+
+test('a failed load on the latest page still resumes realtime logs', async () => {
+  const view = createLogView();
+  const realtime = stubRealtime(view, true);
+  await openHistoryPage(view);
+  assert.equal(realtime.status(), '历史页');
+
+  vm.runInContext('loadLatestLogs()', view.context);
+  view.failSnapshot();
+  await settle();
+  assert.equal(realtime.starts(), 1);
+  assert.equal(realtime.status(), '已连接');
+});
+
+test('a failed load after clearing the search still resumes realtime logs', async () => {
+  const view = createLogView();
+  const realtime = stubRealtime(view, true);
+  vm.runInContext("setLogQuery('abc')", view.context);
+  let pending = view.fireTimer(300);
+  view.resolveSnapshot([100]);
+  await pending;
+
+  vm.runInContext("setLogQuery('')", view.context);
+  pending = view.fireTimer(300);
+  view.failSnapshot();
+  await pending;
+  assert.equal(realtime.starts(), 1);
+  assert.equal(realtime.status(), '已连接');
+});
+
+test('a failed load keeps realtime paused on history pages and off when disabled', async () => {
+  const paused = createLogView();
+  const pausedRealtime = stubRealtime(paused, true);
+  await openHistoryPage(paused);
+  vm.runInContext('loadOlderLogs()', paused.context);
+  paused.failSnapshot();
+  await settle();
+  assert.equal(pausedRealtime.starts(), 0);
+  assert.equal(pausedRealtime.status(), '历史页');
+
+  const disabled = createLogView();
+  const disabledRealtime = stubRealtime(disabled, false);
+  await openHistoryPage(disabled);
+  vm.runInContext('loadLatestLogs()', disabled.context);
+  disabled.failSnapshot();
+  await settle();
+  assert.equal(disabledRealtime.starts(), 0);
+  assert.equal(disabledRealtime.status(), '已关闭');
+});
+
+test('a failed load for a superseded search leaves resuming to the debounced reload', async () => {
+  const view = createLogView();
+  const realtime = stubRealtime(view, true);
+  vm.runInContext("setLogQuery('abc')", view.context);
+  const searchLoad = view.fireTimer(300);
+  // The search is cleared while its snapshot is still in flight, then that snapshot fails.
+  vm.runInContext("setLogQuery('')", view.context);
+  view.failSnapshot();
+  await searchLoad;
+  assert.equal(realtime.starts(), 0);
+
+  const reload = view.fireTimer(300);
+  view.resolveSnapshot([100]);
+  await reload;
+  assert.equal(realtime.starts(), 1);
+});
+
+test('a stale session response does not restart realtime logs', async () => {
+  const view = createLogView();
+  const realtime = stubRealtime(view, true);
+  await openHistoryPage(view);
+  vm.runInContext('loadLatestLogs()', view.context);
+  view.resolveStale();
+  await settle();
+  assert.equal(realtime.starts(), 0);
 });
 
 test('the batch size limit still flushes immediately and counts entries once', async () => {

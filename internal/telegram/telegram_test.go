@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -40,8 +41,64 @@ func TestSendAddsServerRemark(t *testing.T) {
 				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
 			})}}
 			cfg := storage.TGConfig{Token: "token", Chat: "chat", ServerRemark: tt.remark}
-			if !service.Send(context.Background(), cfg, "message") {
-				t.Fatal("Send() returned false")
+			if err := service.Send(context.Background(), cfg, "message"); err != nil {
+				t.Fatalf("Send() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestSendReportsFailureWithoutToken(t *testing.T) {
+	const token = "123456:secret-bot-token"
+	tests := []struct {
+		name      string
+		cfg       storage.TGConfig
+		transport roundTripFunc
+		want      string
+	}{
+		{
+			name: "missing chat",
+			cfg:  storage.TGConfig{Token: token},
+			want: "Bot Token 或 Chat ID 未配置",
+		},
+		{
+			name: "telegram description",
+			cfg:  storage.TGConfig{Token: token, Chat: "chat"},
+			transport: func(req *http.Request) (*http.Response, error) {
+				body := `{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`
+				return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(body))}, nil
+			},
+			want: "Telegram 返回 400：Bad Request: chat not found",
+		},
+		{
+			name: "status without body",
+			cfg:  storage.TGConfig{Token: token, Chat: "chat"},
+			transport: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(""))}, nil
+			},
+			want: "Telegram 返回 502",
+		},
+		{
+			name: "transport error hides request url",
+			cfg:  storage.TGConfig{Token: token, Chat: "chat"},
+			transport: func(req *http.Request) (*http.Response, error) {
+				return nil, errors.New("dial tcp: connection refused")
+			},
+			want: "连接 Telegram 失败：dial tcp: connection refused",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := &Service{http: &http.Client{Transport: tt.transport}}
+			err := service.Send(context.Background(), tt.cfg, "message")
+			if err == nil {
+				t.Fatal("Send() error = nil")
+			}
+			if err.Error() != tt.want {
+				t.Fatalf("Send() error = %q, want %q", err.Error(), tt.want)
+			}
+			if strings.Contains(err.Error(), "secret-bot-token") {
+				t.Fatalf("Send() error leaks the bot token: %q", err.Error())
 			}
 		})
 	}
@@ -241,13 +298,10 @@ func TestBuildReportText(t *testing.T) {
 	t.Run("uses configured report window", func(t *testing.T) {
 		ctx := context.Background()
 		store := newTelegramTestStore(t)
-		if err := store.SaveTGConfig(ctx, storage.TGConfig{ReportTime: "08:00"}); err != nil {
-			t.Fatalf("SaveTGConfig() error = %v", err)
-		}
 
 		service := New(store, logging.New("silent", false))
 		now := time.Date(2026, 6, 28, 8, 30, 0, 0, localtime.Location()).UnixMilli()
-		text, err := service.BuildReport(ctx, now)
+		text, err := service.BuildReport(ctx, "08:00", now)
 		if err != nil {
 			t.Fatalf("BuildReport() error = %v", err)
 		}
@@ -376,9 +430,6 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 func TestBuildReportIncludesDurationOnlyBuckets(t *testing.T) {
 	ctx := context.Background()
 	store := newTelegramTestStore(t)
-	if err := store.SaveTGConfig(ctx, storage.TGConfig{ReportTime: "08:00"}); err != nil {
-		t.Fatalf("SaveTGConfig() error = %v", err)
-	}
 	bucketStart := time.Date(2026, 6, 27, 9, 0, 0, 0, localtime.Location()).UnixMilli()
 	if _, err := store.DB().ExecContext(ctx, `
 		INSERT INTO play_buckets (
@@ -391,7 +442,7 @@ func TestBuildReportIncludesDurationOnlyBuckets(t *testing.T) {
 
 	service := New(store, logging.New("silent", false))
 	now := time.Date(2026, 6, 28, 8, 30, 0, 0, localtime.Location()).UnixMilli()
-	text, err := service.BuildReport(ctx, now)
+	text, err := service.BuildReport(ctx, "08:00", now)
 	if err != nil {
 		t.Fatalf("BuildReport() error = %v", err)
 	}
